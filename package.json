@@ -1,0 +1,48 @@
+{
+  "name": "agent-transaction-firewall",
+  "version": "0.1.0",
+  "description": "Pre-execution safety and risk gate for autonomous onchain agents: decodes EVM calldata, enforces token-aware policy and explains every verdict before a transaction reaches the agent wallet.",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "npm run build && node scripts/bench.mjs",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "keywords": [
+    "ai-agents",
+    "evm",
+    "firewall",
+    "erc20",
+    "calldata",
+    "risk",
+    "policy"
+  ],
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}
