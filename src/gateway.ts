@@ -338,6 +338,9 @@ export class Gateway {
 
     if (options.dryRun) {
       if (verdict.allowed) await agent.firewall.release(verdict, 'dry run');
+      else if (verdict.verdict === 'requiresApproval') {
+        await agent.firewall.reject(verdict, { approver: 'gateway', note: 'dry run' });
+      }
       return base('checked');
     }
     if (verdict.verdict === 'blocked') return this.track(agent.id, verdict, call, base('blocked'));
