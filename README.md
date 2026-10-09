@@ -24,6 +24,8 @@ verdict: "allowed" | "blocked" | "requiresApproval"
 - [Sessions, approvals and reservations](#sessions-approvals-and-reservations)
 - [Audit log](#audit-log)
 - [Wallet integrations](#wallet-integrations)
+- [MCP gateway for multiple agents](#mcp-gateway-for-multiple-agents)
+- [Latency](#latency)
 - [API reference](#api-reference)
 - [Extending: custom stores and sinks](#extending-custom-stores-and-sinks)
 - [Production checklist](#production-checklist)
@@ -79,7 +81,7 @@ The package isn't published to npm yet. Build it from source and install it into
 git clone https://github.com/SRIVISHNUGV-DEV/agent-transaction-firewall.git
 cd agent-transaction-firewall
 npm ci
-npm run check          # typecheck + 89 tests + build to dist/
+npm run check          # typecheck + tests + build to dist/
 
 # in your project
 npm install ../agent-transaction-firewall
@@ -388,7 +390,18 @@ A session is a budget scope (for example, one agent run): `evaluate(tx, { sessio
 2. After sending, call `commit(verdict, { txHash })`. If the send fails **and you know nothing was broadcast**, call `release(verdict)`. `guard()` does this automatically, and keeps the reservation on ambiguous errors such as timeouts unless `releaseOnError` says otherwise.
 3. `approve(verdict, { approver, note })` is bound to the evaluated transaction digest, can be used once, expires after `approvalTtlSeconds`, and re-checks caps against current usage before reserving. Hard rules can't be approved away.
 
-`MemorySessionStore` serves one process. For multiple instances, implement `SessionStore.transact()` with a real lock or compare-and-swap (Redis `WATCH`/`MULTI`, a database row lock). The interface requires atomic, all-or-nothing persistence.
+**Session IDs must come from trusted host code, never from the agent.** A new session starts with a fresh budget, so an agent that can name its own session can reset its caps. The MCP gateway never exposes the session to agents.
+
+`MemorySessionStore` keeps state in memory only. `JournalSessionStore` keeps the same in-memory reads and writes every change to an append-only journal that is replayed and compacted on startup:
+
+```ts
+import { JournalSessionStore, JsonlFileAuditSink } from 'agent-transaction-firewall';
+const sessions = await JournalSessionStore.open('/var/lib/agent-firewall/sessions.jsonl', { fsync: true });
+const audit = new JsonlFileAuditSink('/var/lib/agent-firewall/audit.jsonl', { fsync: true });
+const firewall = createFirewall({ policy, sessions, audit });
+```
+
+The session lock covers only the in-memory decision. Writes are queued in lock order and **group-committed**: concurrent requests share one write and one `fsync`, and each call returns only after its own state and every earlier state are on disk. Both journals serve one process; for several instances, implement `SessionStore.transact()` with a real lock or compare-and-swap (Redis `WATCH`/`MULTI`, a database row lock), or give each agent to exactly one instance.
 
 ## Audit log
 
@@ -396,10 +409,12 @@ Every evaluation, approval, rejection, commit and release is appended as a SHA-2
 
 ```ts
 import { JsonlFileAuditSink, verifyAuditChain } from 'agent-transaction-firewall';
-const audit = new JsonlFileAuditSink('/var/log/agent-firewall/audit.jsonl'); // continues the chain after restart
+const audit = new JsonlFileAuditSink('/var/log/agent-firewall/audit.jsonl', { fsync: true }); // continues the chain after restart
 const firewall = createFirewall({ policy, audit });
 verifyAuditChain(await JsonlFileAuditSink.read(audit.path)); // { valid: true } or the first broken record
 ```
+
+`JsonlFileAuditSink` group-commits concurrent records (`fsync` defaults to `false` here; pass `true` to survive power loss). Several firewalls can share one chain by passing the same `AuditLog` instance as `audit`.
 
 The chain makes edits, deletions and reordering **detectable**. Making them **impossible** needs WORM/object-lock storage, or periodically anchoring the head hash outside the host. The default in-memory sink is for development only and grows without bound. Implement `AuditSink` for your log pipeline; if `append` rejects, the request is blocked.
 
@@ -427,6 +442,64 @@ const sendViaProvider = guard((tx) => provider.sendTransaction(tx), {
 For EIP-4337 or EIP-7702 smart accounts, evaluate the **inner calls** (`calls: [...]`) with `from` set to the account address. Calls the agent makes to its own account through `execute`/`executeBatch` are unwrapped automatically.
 
 Optional simulation: `createFirewall({ simulator: createRpcSimulator({ url }) })` runs an `eth_call` revert check only for requests that aren't already blocked. Reverts are blocked; RPC failures and batches apply `policy.simulation.onUnavailable`. Treat RPC URLs containing API keys as secrets.
+
+## MCP gateway for multiple agents
+
+`agent-transaction-firewall/mcp` turns the firewall into the **only path to the wallet**: a gateway that holds wallet access, serves any number of agents over the [Model Context Protocol](https://modelcontextprotocol.io), and sends only what the firewall allows.
+
+```mermaid
+flowchart LR
+  A1[Agent A] -->|MCP + token A| G[Gateway]
+  A2[Agent B] -->|MCP + token B| G
+  G -->|per-agent policy + budget| F[Firewall]
+  F -->|allowed| W[Wallet / signer RPC]
+  F -->|requiresApproval| Q[Approval queue]
+  O[Human operator] -->|admin token| Q
+  F --> L[(Shared hash-chained audit log)]
+```
+
+- **Per agent:** bearer token (only its SHA-256 is stored), wallet address, policy and budget. An agent can't see another agent's requests.
+- **Tools:** `get_budget`, `transfer_token`, `approve_token`, `send_native`, `send_transaction`, `check_transaction` (dry run), `get_request_status`. There is deliberately **no approve tool**: escalations are decided over the admin API with a separate token, so a prompt-injected agent can't clear its own escalation.
+- **Transports:** Streamable HTTP (`POST /mcp`, JSON responses) for many agents, or stdio for one local agent. Requests carrying a browser `Origin` header are refused.
+- **Admin API:** `GET /admin/pending`, `POST /admin/requests/:id/approve|reject` with `{ "approver", "note"? }`, `GET /admin/audit/verify`.
+- **Wallet backend:** `JsonRpcWallet` sends through any signer that accepts `eth_sendTransaction` (local node, Clef, Web3Signer, a fork), one transaction at a time per sender so nonces never race. Implement `WalletBackend` for Coinbase, Privy, Safe or a KMS signer.
+- **Outcomes:** `executed`, `checked`, `blocked`, `pending_approval`, `rejected`, `expired`, `failed` (wallet refused before broadcast; budget released) and `unknown` (for example a timeout; budget stays reserved).
+
+```jsonc
+// gateway.json — amounts are base-unit strings
+{
+  "chainId": 8453,
+  "rpcUrl": "http://127.0.0.1:8545",
+  "listen": { "host": "127.0.0.1", "port": 8787 },
+  "adminTokenSha256": "<sha256 of the admin token>",
+  "storage": { "dir": "/var/lib/agent-firewall", "fsync": true },
+  "agents": [
+    { "id": "payments-bot", "tokenSha256": "<sha256>", "wallet": "0x…", "policy": { "version": 1, "chainIds": [8453], "…": "…" } }
+  ]
+}
+```
+
+```sh
+npx transaction-firewall token                                   # prints a new token and its SHA-256
+npx transaction-firewall serve --config gateway.json             # HTTP MCP + admin API
+npx transaction-firewall stdio --config gateway.json --agent payments-bot
+```
+
+MCP client config for an agent: `{ "mcpServers": { "wallet": { "type": "http", "url": "http://127.0.0.1:8787/mcp", "headers": { "Authorization": "Bearer <agent token>" } } } }`. Without `storage`, budgets and the audit log are in memory, and the gateway refuses to start when `NODE_ENV=production`.
+
+## Latency
+
+The firewall makes no network calls on the decision path. Measured on a single-vCPU development VM (Node 22), `npm run bench`:
+
+| Stores | Single ERC-20 transfer p50 / p99 | 8-call batch p50 / p99 |
+|---|---|---|
+| In memory | 0.08 / 0.27 ms | 0.17 / 0.83 ms |
+| Journal + audit file | 0.27 / 0.40 ms | 0.36 / 0.72 ms |
+| Journal + audit file, `fsync` | 0.28 / 0.38 ms | 0.37 / 0.80 ms |
+
+One process sustains about 11,000–13,000 evaluations per second. With 64 agents firing at once, per-request latency is 2–5 ms, which is time spent waiting for the single thread, not evaluation time. `BENCH_MAX_P99_MS=1 npm run bench` fails if any non-fsync p99 exceeds 1 ms. fsync cost depends on the disk; this VM's storage acknowledges flushes almost immediately.
+
+On a Base mainnet fork, 20 agents sent 500 concurrent transfers through the MCP gateway (fsync on). The firewall accounted for a median of 0.7% of end-to-end time; wallet and chain time made up the rest. Budgets were enforced exactly (200 transfers executed, every agent stopped at its cap), onchain balances matched the executed count, and the 740-record audit chain verified.
 
 ## API reference
 
@@ -478,7 +551,9 @@ Returns a function with the same signature as `send`. Options: `firewall`, `chai
 | `evaluatePolicy(input)`, `riskScore(findings)` | Pure engine, no sessions or audit. |
 | `describeAction(action)` | Plain-English text for one action. |
 | `AuditLog`, `MemoryAuditSink`, `JsonlFileAuditSink`, `verifyAuditChain`, `GENESIS_HASH` | Audit logging and verification. |
-| `MemorySessionStore` | Default single-process session store. |
+| `MemorySessionStore`, `JournalSessionStore` | In-memory session store, and the same with a group-committed journal. |
+| `GroupCommitFile` | Append-only line writer used by the durable stores. |
+| `agent-transaction-firewall/mcp` | `Gateway`, `createGatewayServer`, `serveStdio`, `handleMcpMessage`, `JsonRpcWallet`, `hashToken`. |
 | `createRpcSimulator({ url, timeoutMs?, fetch? })` | `eth_call` revert check (default timeout 1500 ms; batches reported as unavailable). |
 | `parseUnits`, `formatUnits`, `UINT256_MAX` | Amount helpers. |
 | `SELECTORS`, `PERMIT2_ADDRESS`, `UNLIMITED_APPROVAL_THRESHOLD` | Constants used by the decoder. |
@@ -501,8 +576,11 @@ interface SessionStore {
 interface AuditSink {
   append(record: AuditRecord): Promise<void>; // reject → the request is blocked
   tail?(): Promise<AuditRecord | undefined>;   // last record, to continue the chain after restart
+  readonly pipelined?: boolean;                // see below
 }
 ```
+
+Set `pipelined: true` only if the sink persists overlapping `append` calls in call order and, after one rejects, rejects every later append until `tail()` is called. The log then prepares records while earlier writes are in flight, which lets the sink batch them.
 
 `AuditRecord` is `{ seq, timestamp, type, requestId, sessionId, payload, prevHash, hash }`, where `type` is `evaluation`, `approval`, `rejection`, `commit` or `release`. Ship records to append-only storage (S3 Object Lock, a WORM bucket, a ledger table) and periodically publish the latest `hash` somewhere the host can't rewrite.
 
@@ -513,7 +591,8 @@ interface AuditSink {
 - [ ] Every token the agent should touch is in `tokens` with realistic `perTransactionMax` / `sessionMax`.
 - [ ] Protocols list explicit `selectors`, never "any function".
 - [ ] A durable, append-only `AuditSink` is configured, and its head hash is anchored externally.
-- [ ] A shared, locking `SessionStore` is used if more than one instance runs.
+- [ ] Sessions and the audit log are durable (`JournalSessionStore` + `JsonlFileAuditSink` with `fsync: true`, or the gateway's `storage.dir`); a shared, locking `SessionStore` is used if more than one instance serves the same agent.
+- [ ] Session IDs are set by host code, never by the agent.
 - [ ] `commit()` / `release()` are always called (or `guard()` is used), so reservations don't leak.
 - [ ] Off-chain signing (`signTypedData`, `personal_sign`) is gated separately or disabled for agents.
 - [ ] Wallet-native limits (Safe guards, provider policies, on-chain session caps) are in place as a second layer.
@@ -525,7 +604,9 @@ interface AuditSink {
 - **No balance-diff simulation.** The engine judges declared intent from calldata; the optional `eth_call` check catches reverts, not hidden side effects. An allowlisted protocol can still move tokens within allowances already granted, which is why approvals are budgeted and spenders must be trusted.
 - **Unknown calls are unverified by definition.** Their default is `requiresApproval`; use `'block'` for unattended agents.
 - **USD-denominated limits are not built in.** Limits are per token in base units, which keeps decisions deterministic and oracle-free.
-- **The defaults are single-process.** Sessions and the default audit sink are in memory; use durable implementations for production.
+- **Protocol calldata is checked by target and selector only.** For an allowlisted protocol such as a Uniswap router, the firewall doesn't decode the arguments, so it doesn't check the swap recipient or the minimum output (slippage). Restrict protocols to the selectors you need and keep their approvals small.
+- **Approval thresholds apply per transaction.** Splitting a payment into chunks below `requireApprovalAbove` isn't detected; only `sessionMax` bounds the total.
+- **The defaults are in memory.** Use `JournalSessionStore` and a durable audit sink (or the gateway's `storage.dir`) in production.
 - This is a policy-enforcement layer, not a substitute for contract audits, key management or wallet-level controls.
 
 ## FAQ
@@ -564,9 +645,8 @@ interface AuditSink {
 | `npm test` | Vitest suite (ABI strictness, decoder, policy edge cases, concurrency, approvals, audit tampering, middleware, simulator) |
 | `npm run typecheck` | Strict TypeScript (`exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`) |
 | `npm run build` | Emit ESM + declarations to `dist/` |
-| `npm run bench` | Latency percentiles for `evaluate()` with in-memory stores |
-
-Measured on a single-vCPU development VM (Node 22, n=5000, in-memory stores): single ERC-20 transfer p50 0.10 ms / p95 0.23 ms; 8-call batch p50 0.23 ms / p95 0.28 ms. Durable audit sinks and remote session stores add their own I/O latency.
+| `npm run bench` | Latency percentiles and concurrent throughput for in-memory, file and fsync stores (see [Latency](#latency)) |
+| `node scripts/fork-lab.mjs` | Base mainnet fork (Foundry `anvil`) plus a gateway serving three agents, with `mcp.sh` and `admin.sh` clients for manual or agent-driven testing |
 
 ### Layout
 
@@ -578,6 +658,10 @@ src/explain.ts     plain-English descriptions
 src/firewall.ts    validation, reservations, approvals, fail-closed orchestration
 src/middleware.ts  guard() wrapper and typed errors
 src/session.ts     session store interface + in-memory implementation
+src/storage.ts     group-commit writer and journaled session store
+src/gateway.ts     multi-agent gateway: auth, wallet backends, approval queue
+src/mcp.ts         MCP server (stdio + HTTP) and admin API
+src/cli.ts         transaction-firewall command
 src/audit.ts       hash-chained audit log and sinks
 src/simulation.ts  optional eth_call simulator
 src/schemas.ts     Zod schemas for requests and policies

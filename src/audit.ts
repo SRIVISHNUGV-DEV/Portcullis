@@ -5,8 +5,9 @@
 // tamper-evident; tamper-proof retention additionally needs WORM/object-lock
 // storage or periodic anchoring of the head hash outside the host.
 
-import { appendFile, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { canonicalJson, deepFreeze, sha256Hex } from './canonical.js';
+import { GroupCommitFile, type GroupCommitOptions } from './storage.js';
 
 export type AuditEventType = 'evaluation' | 'approval' | 'rejection' | 'commit' | 'release';
 
@@ -25,12 +26,26 @@ export interface AuditSink {
   append(record: AuditRecord): Promise<void>;
   /** Last persisted record, used to continue the chain after a restart. */
   tail?(): Promise<AuditRecord | undefined>;
+  /**
+   * True if append() may be called again before the previous call resolves: records
+   * must persist in call order, and after a rejected append every later append must
+   * reject until tail() is called. Lets the log prepare records while writes are in flight.
+   */
+  readonly pipelined?: boolean;
 }
 
 export const GENESIS_HASH = '0'.repeat(64);
 
 function hashRecord(record: Omit<AuditRecord, 'hash'>): string {
   return sha256Hex(canonicalJson(record));
+}
+
+/** Same digest as hashRecord(), reusing the already-canonical payload string. Keys are in sorted order. */
+function hashRecordWithPayload(body: Omit<AuditRecord, 'hash' | 'payload'>, payloadJson: string): string {
+  return sha256Hex(
+    `{"payload":${payloadJson},"prevHash":${JSON.stringify(body.prevHash)},"requestId":${JSON.stringify(body.requestId)},` +
+      `"seq":${body.seq},"sessionId":${JSON.stringify(body.sessionId)},"timestamp":${JSON.stringify(body.timestamp)},"type":${JSON.stringify(body.type)}}`,
+  );
 }
 
 export class MemoryAuditSink implements AuditSink {
@@ -49,17 +64,33 @@ export class MemoryAuditSink implements AuditSink {
   }
 }
 
-/** JSON Lines file sink. One record per line, appended with O_APPEND semantics. */
+/**
+ * JSON Lines file sink. One record per line; concurrent appends are group-committed
+ * (one write, plus one fsync when `fsync` is true, per batch).
+ */
 export class JsonlFileAuditSink implements AuditSink {
-  constructor(readonly path: string) {}
+  readonly pipelined = true;
+  private readonly writer: GroupCommitFile;
 
-  async append(record: AuditRecord): Promise<void> {
-    await appendFile(this.path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'a', mode: 0o600 });
+  constructor(
+    readonly path: string,
+    options: GroupCommitOptions = { fsync: false },
+  ) {
+    this.writer = new GroupCommitFile(path, options);
+  }
+
+  append(record: AuditRecord): Promise<void> {
+    return this.writer.append(JSON.stringify(record));
   }
 
   async tail(): Promise<AuditRecord | undefined> {
     const records = await JsonlFileAuditSink.read(this.path);
+    this.writer.reset();
     return records[records.length - 1];
+  }
+
+  close(): Promise<void> {
+    return this.writer.close();
   }
 
   static async read(path: string): Promise<AuditRecord[]> {
@@ -80,6 +111,8 @@ export class JsonlFileAuditSink implements AuditSink {
 export class AuditLog {
   private head: { seq: number; hash: string } | undefined;
   private queue: Promise<unknown> = Promise.resolve();
+  /** Bumped on every failure so stale failures cannot reset a re-synchronized head. */
+  private generation = 0;
 
   constructor(
     private readonly sink: AuditSink,
@@ -87,36 +120,70 @@ export class AuditLog {
   ) {}
 
   /** Append a record. Serialized so the chain order equals the append order. Rejects if the sink fails. */
-  record(
+  async record(
     type: AuditEventType,
     requestId: string,
     sessionId: string,
     payload: Record<string, unknown>,
   ): Promise<AuditRecord> {
-    const run = this.queue.then(async () => {
+    const { record, persisted } = await this.prepare(type, requestId, sessionId, payload);
+    await persisted;
+    return record;
+  }
+
+  /**
+   * Chain and enqueue a record without waiting for a pipelined sink to store it.
+   * `persisted` settles once the sink has stored the record (or failed); callers
+   * must not act on the record before it resolves.
+   */
+  prepare(
+    type: AuditEventType,
+    requestId: string,
+    sessionId: string,
+    payload: Record<string, unknown>,
+  ): Promise<{ record: AuditRecord; persisted: Promise<void> }> {
+    const step = this.queue.then(async () => {
       if (!this.head) {
         const last = this.sink.tail ? await this.sink.tail() : undefined;
         this.head = last ? { seq: last.seq, hash: last.hash } : { seq: 0, hash: GENESIS_HASH };
       }
-      const body = {
+      const payloadJson = canonicalJson(payload);
+      const header = {
         seq: this.head.seq + 1,
         timestamp: new Date(this.clock()).toISOString(),
         type,
         requestId,
         sessionId,
-        payload: JSON.parse(canonicalJson(payload)) as Record<string, unknown>,
         prevHash: this.head.hash,
       };
-      const record = deepFreeze({ ...body, hash: hashRecord(body) });
-      await this.sink.append(record);
+      const record = deepFreeze({
+        ...header,
+        payload: JSON.parse(payloadJson) as Record<string, unknown>,
+        hash: hashRecordWithPayload(header, payloadJson),
+      });
+      const generation = this.generation;
+      const persisted = this.sink.append(record);
+      if (!this.sink.pipelined) await persisted;
       this.head = { seq: record.seq, hash: record.hash };
-      return record;
+      return { record, persisted, generation };
     });
-    this.queue = run.catch(() => {
-      // Re-read the sink's tail next time: a failed append may or may not have persisted.
-      this.head = undefined;
+    this.queue = step.catch(() => this.resync(this.generation));
+    return step.then(({ record, persisted, generation }) => {
+      const tracked = persisted.catch((e: unknown) => {
+        this.resync(generation);
+        throw e;
+      });
+      // Mark as handled: the caller may await it after other work.
+      tracked.catch(() => undefined);
+      return { record, persisted: tracked };
     });
-    return run;
+  }
+
+  /** Re-read the sink's tail next time: a failed append may or may not have persisted. */
+  private resync(generation: number): void {
+    if (generation !== this.generation) return;
+    this.generation += 1;
+    this.head = undefined;
   }
 }
 

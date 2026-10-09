@@ -33,8 +33,8 @@ export interface SessionState {
 
 /**
  * Storage for session usage. `transact` must run `fn` with exclusive access to the
- * session and persist the returned state atomically; if `fn` throws, nothing is
- * persisted. Distributed implementations need an equivalent lock or
+ * session and persist the returned state atomically before resolving; if `fn` throws,
+ * nothing is persisted. Distributed implementations need an equivalent lock or
  * compare-and-swap (e.g. Redis WATCH/MULTI, a database row lock).
  */
 export interface SessionStore {
@@ -57,23 +57,41 @@ export function totalSpent(state: SessionState): Spend {
 }
 
 export class MemorySessionStore implements SessionStore {
-  private readonly states = new Map<string, SessionState>();
+  protected readonly states: Map<string, SessionState>;
   private readonly locks = new Map<string, Promise<unknown>>();
 
+  constructor(initial?: Iterable<readonly [string, SessionState]>) {
+    this.states = new Map(initial);
+  }
+
+  /**
+   * The session lock covers only `fn`. Persistence is enqueued in lock order and awaited
+   * after the lock is released, so concurrent transactions share one durable write;
+   * each caller still resolves only once its state (and every earlier state) is stored.
+   */
   async transact<T>(sessionId: string, now: number, fn: (state: SessionState) => T | Promise<T>): Promise<T> {
     const previous = this.locks.get(sessionId) ?? Promise.resolve();
-    const run = previous.then(async () => {
+    const critical = previous.then(async () => {
       const current = this.states.get(sessionId) ?? newSessionState(sessionId, now);
       const draft = structuredClone(current);
       const result = await fn(draft);
+      const persisted = this.persist(draft);
       this.states.set(sessionId, draft);
-      return result;
+      return { result, persisted };
     });
-    const settled = run.catch(() => undefined);
+    const settled = critical.catch(() => undefined);
     this.locks.set(sessionId, settled);
     void settled.then(() => {
       if (this.locks.get(sessionId) === settled) this.locks.delete(sessionId);
     });
-    return run;
+    const { result, persisted } = await critical;
+    await persisted;
+    return result;
   }
+
+  /**
+   * Durability hook, called in lock order with each new state. A rejection fails the
+   * transaction; the in-memory state keeps the change, which only over-counts budget.
+   */
+  protected persist(_state: SessionState): Promise<void> | void {}
 }
