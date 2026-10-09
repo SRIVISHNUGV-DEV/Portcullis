@@ -8,6 +8,31 @@ verdict: "allowed" | "blocked" | "requiresApproval"
 
 **Why:** most agent value moves as ERC-20 calldata with `value = 0`. Gates that only look at native ETH value see a $5M USDC transfer, an unlimited `approve`, or `setApprovalForAll` to a drainer as a harmless zero-value call.
 
+## Contents
+
+- [Where it sits](#where-it-sits)
+- [How a request is evaluated](#how-a-request-is-evaluated)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Walkthroughs](#walkthroughs)
+- [Verdicts](#verdicts)
+- [What it decodes](#what-it-decodes)
+- [Policy](#policy)
+- [Policy reference](#policy-reference)
+- [Reason codes](#reason-codes)
+- [Risk score](#risk-score)
+- [Sessions, approvals and reservations](#sessions-approvals-and-reservations)
+- [Audit log](#audit-log)
+- [Wallet integrations](#wallet-integrations)
+- [API reference](#api-reference)
+- [Extending: custom stores and sinks](#extending-custom-stores-and-sinks)
+- [Production checklist](#production-checklist)
+- [Security model and limitations](#security-model-and-limitations)
+- [FAQ](#faq)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [License](#license)
+
 ## Where it sits
 
 ```mermaid
@@ -21,6 +46,47 @@ flowchart LR
 ```
 
 > **The firewall is only a boundary if the agent cannot reach the wallet any other way.** Run it in the service that holds the wallet credentials (signing service, API gateway, or MCP tool server), not inside the same sandbox as the agent's private key. Keep wallet-native controls (Safe guards, provider policy engines, onchain session limits) as a second layer.
+
+## How a request is evaluated
+
+```mermaid
+flowchart TD
+  R[evaluate tx, sessionId] --> V{Zod: valid request?}
+  V -- no --> B1[blocked: INVALID_REQUEST]
+  V -- yes --> D[Strict decode: every call, nested execute/executeBatch unwrapped]
+  D -- malformed / non-canonical --> B2[blocked: CALLDATA_MALFORMED]
+  D --> E[Policy engine: chain, denylist, assets, spenders, recipients, protocols, caps]
+  E --> S{Simulator configured?}
+  S -- yes, not already blocked --> SIM[eth_call revert check]
+  S -- no --> VR[Verdict]
+  SIM --> VR
+  VR -- allowed --> RES[Reserve spend in session, atomically]
+  VR -- requiresApproval --> PA[Store pending approval, TTL]
+  VR -- blocked --> X[Return reasons + remediation]
+  RES --> A[(Append hash-chained audit record)]
+  PA --> A
+  X --> A
+  A -- write fails --> B3[blocked: AUDIT_UNAVAILABLE, reservation rolled back]
+```
+
+The engine is a **pure function** of `(request, policy, session usage, time)`: no network, no randomness, no oracle. The same input always gives the same verdict, which is what makes decisions reviewable and testable. The only I/O is the optional simulator, the session store and the audit sink, and a failure in any of them blocks the request.
+
+## Installation
+
+The package isn't published to npm yet. Build it from source and install it into your project:
+
+```sh
+git clone https://github.com/SRIVISHNUGV-DEV/agent-transaction-firewall.git
+cd agent-transaction-firewall
+npm ci
+npm run check          # typecheck + 89 tests + build to dist/
+
+# in your project
+npm install ../agent-transaction-firewall
+# or: npm pack here, then npm install ./agent-transaction-firewall-0.1.0.tgz
+```
+
+Requirements: Node.js 20 or later, ESM (`"type": "module"` or a bundler). The only runtime dependency is `zod`. ethers and viem are **not** required; amounts are plain `bigint`.
 
 ## Quick start
 
@@ -42,6 +108,90 @@ await send({ to: USDC, data }); // throws FirewallBlockedError / ApprovalRequire
 ```
 
 Use `firewall.evaluate(tx)` directly when you want the verdict without sending anything (dry runs, agent self-checks, approval UIs).
+
+## Walkthroughs
+
+All examples assume `USDC`, `TREASURY`, `wallet` and `agentWallet` are defined by your application.
+
+### 1. Dry run: ask before you send
+
+```ts
+const verdict = await firewall.evaluate(
+  { chainId: 8453, from: agentWallet, to: USDC, data: transferCalldata },
+  { sessionId: 'run-42' },
+);
+
+console.log(verdict.verdict);   // "allowed" | "requiresApproval" | "blocked"
+console.log(verdict.summary);   // one-line plain-English description
+for (const r of verdict.reasons) console.log(r.code, r.outcome, r.message, r.remediation ?? '');
+```
+
+An `allowed` verdict **reserves** budget. If you decide not to send, call `firewall.release(verdict)`; if you send, call `firewall.commit(verdict, { txHash })`.
+
+### 2. Human approval
+
+```ts
+const pending = await firewall.evaluate(tx, { sessionId: 'run-42' });
+
+if (pending.verdict === 'requiresApproval') {
+  // Show pending.summary and pending.reasons to an operator (Slack, dashboard, ...).
+  const ok = await askOperator(pending.summary);
+  if (!ok) {
+    await firewall.reject(pending, { approver: 'alice@example.com', note: 'unexpected recipient' });
+  } else {
+    const approved = await firewall.approve(pending, { approver: 'alice@example.com' });
+    if (approved.allowed) {
+      const hash = await wallet.sendTransaction(tx);
+      await firewall.commit(approved, { txHash: hash });
+    }
+    // approved.verdict can be "blocked" if the session budget was used up while waiting.
+  }
+}
+```
+
+Approvals are bound to `txDigest` (the exact normalized transaction), single-use and expire after `approvalTtlSeconds`. `approve()` throws `FirewallStateError` for an expired, unknown, already-decided or mismatched approval.
+
+### 3. Batches and smart accounts
+
+```ts
+const verdict = await firewall.evaluate({
+  chainId: 8453,
+  from: smartAccount,
+  calls: [
+    { to: USDC, data: approveRouterCalldata },     // finite approval → counted as spend
+    { to: ROUTER, data: swapCalldata, value: 0n }, // must be an allowlisted protocol + selector
+  ],
+});
+```
+
+Every call is decoded, token amounts are **summed across the batch** for per-transaction caps, and `execute`/`executeBatch` calls on `from` itself are unwrapped up to `limits.maxNestingDepth`.
+
+### 4. Check remaining budget
+
+```ts
+const u = await firewall.usage('run-42');
+// { createdAt, txCount, spent: { native: "…", tokens: { "0x8335…": "…" } }, pendingApprovals }
+```
+
+`spent` includes both committed spend and outstanding reservations, in base units.
+
+### 5. Wrap a send function with `guard()`
+
+```ts
+import { guard, FirewallBlockedError, ApprovalRequiredError } from 'agent-transaction-firewall';
+
+const send = guard((tx) => wallet.sendTransaction(tx), { firewall, chainId: 8453, from: agentWallet });
+
+try {
+  await send({ to: USDC, data });
+} catch (e) {
+  if (e instanceof FirewallBlockedError) return { error: e.verdict.summary, fix: e.verdict.reasons.map((r) => r.remediation) };
+  if (e instanceof ApprovalRequiredError) return { pending: e.verdict.requestId };
+  throw e; // the wallet itself failed
+}
+```
+
+Returning `e.verdict.summary` and the remediations to the LLM lets the agent correct itself (for example, approve an exact amount instead of an unlimited one).
 
 ## Verdicts
 
@@ -128,6 +278,108 @@ Accounting rules worth knowing:
 - **Third-party pulls count.** `transferFrom` and EIP-3009 transfers out of a treasury count against limits even though the funds don't leave the agent wallet.
 - Allowlisted protocols are trusted spenders automatically. Tokens and collections cannot also be protocols, because unrestricted selectors would bypass their limits; use `allowedFunctions` instead.
 
+## Policy reference
+
+Amounts accept `bigint`, a base-unit decimal string (`"500000000"`), a `0x` hex string or a safe integer. Addresses are normalized to lowercase. A `Mode` is `'block'` or `'requireApproval'`.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `version` | `1` | required | Schema version. |
+| `name` | string | — | Label shown in logs. |
+| `chainIds` | chain ID[] | required | Chains this policy accepts; anything else → `CHAIN_NOT_ALLOWED`. |
+| `native.symbol` | string | `'ETH'` | Display symbol. |
+| `native.perTransactionMax` | amount | required | Max native value per request, summed across all calls. |
+| `native.sessionMax` | amount | required | Max native value per session (committed + reserved). |
+| `native.requireApprovalAbove` | amount | — | Within caps but above this → human approval. |
+| `tokens[]` | TokenRule | `[]` | Configured ERC-20s (see below). |
+| `nfts[]` | NftRule | `[]` | Configured ERC-721/1155 collections. |
+| `protocols[]` | ProtocolRule | `[]` | Allowlisted contracts the agent may call. |
+| `approvals.spenders` | address[] | `[]` | Trusted spenders/operators. Protocol addresses are trusted automatically. |
+| `approvals.unknownSpender` | Mode | `'requireApproval'` | Approval to a spender not trusted. |
+| `approvals.operatorApprovals` | Mode | `'block'` | `setApprovalForAll(operator, true)` to an untrusted operator. |
+| `recipients.allow` | address[] | — | If set, transfers to other addresses aren't automatically allowed. |
+| `recipients.notAllowlisted` | Mode | `'requireApproval'` | Transfer to an address not in `recipients.allow`. |
+| `denylist` | address[] | `[]` | Any interaction with these → blocked. Can't overlap trusted lists. |
+| `unlistedAssets` | Mode | `'requireApproval'` | Token or collection not configured. |
+| `unknownContractCalls` | Mode | `'requireApproval'` | Non-allowlisted contract, unrecognized function, or disallowed selector. |
+| `contractDeployment` | Mode | `'block'` | Calls with no `to` (contract creation). |
+| `session.maxDurationSeconds` | int | — | Session older than this → `SESSION_EXPIRED`. |
+| `session.maxTransactions` | int | — | Max allowed/approved requests per session. |
+| `limits.maxCalls` | 1–256 | `16` | Max effective calls after unwrapping. |
+| `limits.maxNestingDepth` | 0–4 | `2` | Max `execute`/`executeBatch` nesting. |
+| `limits.maxCalldataBytes` | 4–1 048 576 | `131072` | Max calldata per call. |
+| `approvalTtlSeconds` | 1–86 400 | `900` | How long a `requiresApproval` verdict can be approved. |
+| `simulation.onUnavailable` | Mode | `'requireApproval'` | Simulator configured but couldn't simulate (RPC error, batch). |
+
+**TokenRule**
+
+| Field | Default | Meaning |
+|---|---|---|
+| `address`, `symbol`, `decimals` | required | Token identity. `decimals` is used only for display. |
+| `perTransactionMax` | required | Max moved **or approved** per request (summed across a batch). |
+| `sessionMax` | required | Max moved or approved per session, including reservations. |
+| `requireApprovalAbove` | — | Above this (within caps) → human approval. |
+| `maxApproval` | `perTransactionMax` | Largest single allowance grant. |
+| `allowedFunctions` | `[]` | Extra selectors allowed on the token, e.g. WETH `deposit()` `0xd0e30db0`. |
+
+**NftRule**: `address`, `name`, `standard` (`'erc721'` \| `'erc1155'`), `allowTransfers` (default `false`; when false, transfers out need approval).
+
+**ProtocolRule**: `name`, `address`, `selectors` (omit to allow any function, at least one if set), `maxNativeValue` (max native value per call).
+
+Validation rejects, with `PolicyValidationError`: unknown keys, an address configured twice (token, collection or protocol), and an address that is both denylisted and trusted.
+
+## Reason codes
+
+Each finding in `verdict.reasons` has a `code`, an `outcome` (`block`, `requireApproval` or `info`), a `severity`, a `message`, an optional `remediation` and a call `path`. "Mode" means the outcome comes from the policy field shown.
+
+| Code | Outcome | Severity | Trigger |
+|---|---|---|---|
+| `INVALID_REQUEST` | block | critical | Request failed schema validation. |
+| `INVALID_SESSION_ID` | block | critical | Session ID isn't 1–128 chars of `[A-Za-z0-9_.:@-]`. |
+| `EVALUATION_ERROR` | block | critical | Any internal exception (fail closed). |
+| `AUDIT_UNAVAILABLE` | block | critical | Audit write failed; reservation rolled back. |
+| `CHAIN_NOT_ALLOWED` | block | critical | `chainId` not in `chainIds`. |
+| `DENYLISTED_ADDRESS` | block | critical | Target, recipient, spender or owner is denylisted. |
+| `CALLDATA_MALFORMED` | block | critical | Known selector with bad or non-canonical arguments. |
+| `CALLDATA_TOO_LARGE` | block | critical | Calldata over `limits.maxCalldataBytes`. |
+| `TOO_MANY_CALLS` | block | critical | More than `limits.maxCalls` effective calls. |
+| `NESTING_TOO_DEEP` | block | critical | Wallet wrappers nested deeper than `limits.maxNestingDepth`. |
+| `WALLET_SELF_CALL` | block | critical | Call to the agent's own wallet that isn't `execute`/`executeBatch`. |
+| `UNLIMITED_APPROVAL` | block | critical | Allowance ≥ 2¹²⁸. |
+| `APPROVAL_EXCEEDS_MAX` | block | high | Allowance above `maxApproval`. |
+| `NATIVE_PER_TX_LIMIT` / `TOKEN_PER_TX_LIMIT` | block | high | Request total over `perTransactionMax`. |
+| `NATIVE_SESSION_LIMIT` / `TOKEN_SESSION_LIMIT` | block | high | Session total would exceed `sessionMax`. |
+| `SESSION_EXPIRED` | block | high | Session older than `session.maxDurationSeconds`. |
+| `SESSION_TX_LIMIT` | block | high | `session.maxTransactions` reached. |
+| `PROTOCOL_VALUE_EXCEEDED` | block | high | Native value over a protocol's `maxNativeValue`. |
+| `SIMULATION_REVERTED` | block | critical | `eth_call` reverted. |
+| `OPERATOR_APPROVAL` | mode `approvals.operatorApprovals` | critical | `setApprovalForAll(…, true)` to an untrusted operator. |
+| `CONTRACT_DEPLOYMENT` | mode `contractDeployment` | critical | Contract creation. |
+| `UNTRUSTED_SPENDER` | mode `approvals.unknownSpender` | high | Approval to an untrusted spender. |
+| `RECIPIENT_NOT_ALLOWLISTED` | mode `recipients.notAllowlisted` | high | Recipient not in `recipients.allow`. |
+| `UNLISTED_ASSET` | mode `unlistedAssets` | high | Token/collection not configured. |
+| `UNKNOWN_CONTRACT_CALL` | mode `unknownContractCalls` | high | Call to a contract that isn't allowlisted. |
+| `UNRECOGNIZED_TOKEN_FUNCTION` | mode `unknownContractCalls` | high | Function on a token that isn't a transfer/approval or in `allowedFunctions`. |
+| `PROTOCOL_FUNCTION_NOT_ALLOWED` | mode `unknownContractCalls` | high | Selector not in a protocol's `selectors`. |
+| `SIMULATION_UNAVAILABLE` | mode `simulation.onUnavailable` | medium | Simulator couldn't run. |
+| `BURN_ADDRESS_RECIPIENT` | requireApproval | high | Transfer to the zero address. |
+| `NATIVE_APPROVAL_THRESHOLD` / `TOKEN_APPROVAL_THRESHOLD` | requireApproval | medium | Above `requireApprovalAbove`. |
+| `NFT_TRANSFER_NOT_PREAPPROVED` | requireApproval | medium | Transfer from a collection with `allowTransfers: false`. |
+| `THIRD_PARTY_SOURCE` / `THIRD_PARTY_OWNER` | info | medium | Funds pulled from, or an approval granted on behalf of, an address other than `from`. |
+| `ALLOWANCE_REVOKED` / `ALLOWANCE_DECREASED` / `OPERATOR_REVOKED` | info | low | Risk-reducing actions; always allowed. |
+
+How the verdict is chosen: any `block` finding → `blocked`; otherwise any `requireApproval` finding → `requiresApproval`; otherwise `allowed`. Treat the `code` strings as the stable contract; message wording may change.
+
+## Risk score
+
+`riskScore` (0–100) and `riskLevel` help reviewers prioritize. They **never** change the verdict.
+
+- Severity weights: low 10, medium 30, high 60, critical 90.
+- Sort the weights descending. The largest counts fully, and each next one adds `weight × 0.4^i`, so one critical finding dominates and many small findings can't add up to a false emergency.
+- Capped at 100. Levels: ≥ 80 critical, ≥ 55 high, ≥ 25 medium, otherwise low.
+
+Example: one `UNLIMITED_APPROVAL` (90) plus one `UNTRUSTED_SPENDER` (60) → 90 + 24 = 100 (critical).
+
 ## Sessions, approvals and reservations
 
 A session is a budget scope (for example, one agent run): `evaluate(tx, { sessionId })`. It starts on first use.
@@ -176,6 +428,97 @@ For EIP-4337 or EIP-7702 smart accounts, evaluate the **inner calls** (`calls: [
 
 Optional simulation: `createFirewall({ simulator: createRpcSimulator({ url }) })` runs an `eth_call` revert check only for requests that aren't already blocked. Reverts are blocked; RPC failures and batches apply `policy.simulation.onUnavailable`. Treat RPC URLs containing API keys as secrets.
 
+## API reference
+
+Everything is exported from the package root.
+
+### Firewall
+
+| Member | Description |
+|---|---|
+| `createFirewall(options)` / `new Firewall(options)` | `options`: `policy` (input or compiled; invalid input throws `PolicyValidationError`), `audit?: AuditSink`, `sessions?: SessionStore`, `simulator?: Simulator`, `clock?: () => number`, `generateId?: () => string`. |
+| `evaluate(tx, { sessionId? })` | Returns a `Verdict`. **Never throws.** `tx` is `{ chainId, from, to?, value?, data? }` or `{ chainId, from, calls: [{ to?, value?, data? }] }` (1–256 calls). Unknown fields such as `gas` and `nonce` are ignored. |
+| `approve(verdict, { approver, note? })` | Approves a `requiresApproval` verdict and re-checks limits. Returns an `allowed` verdict with a reservation, or a `blocked` one. |
+| `reject(verdict, { approver, note? })` | Rejects a pending approval permanently. |
+| `commit(verdict, { txHash? })` | Turns the reservation into committed spend after sending. |
+| `release(verdict, reason?)` | Returns the reserved budget when nothing was broadcast. |
+| `usage(sessionId?)` | `{ createdAt, txCount, spent: { native, tokens }, pendingApprovals }`. |
+| `policy`, `policyHash` | Compiled policy and its SHA-256 (recorded in every verdict and audit record). |
+
+`approve`, `reject`, `commit` and `release` throw `FirewallStateError` on misuse (wrong verdict type, unknown or reused reservation/approval, expired window).
+
+### Verdict
+
+| Field | Description |
+|---|---|
+| `requestId`, `sessionId` | Identifiers; `requestId` links audit records. |
+| `verdict`, `allowed` | Decision; `allowed` is true only when the transaction may be sent now. |
+| `chainId`, `txDigest`, `policyHash` | What was evaluated, under which policy. |
+| `riskScore`, `riskLevel` | See [Risk score](#risk-score). |
+| `reasons` | `Finding[]`; see [Reason codes](#reason-codes). |
+| `actions` | Decoded actions (`native_transfer`, `token_transfer`, `token_approval`, NFT actions, contract calls…); amounts are base-unit strings. |
+| `summary`, `explanation` | One-line and per-action plain-English text, with full addresses. |
+| `spend` | `{ native, tokens }` reserved by this request. |
+| `reservationId`, `approvalExpiresAt`, `approval` | Present when relevant. |
+| `evaluatedAt`, `durationMs`, `auditHash` | Timing and the audit record hash (`null` if auditing failed). |
+
+Verdicts are deep-frozen and JSON-serializable.
+
+### guard(send, options)
+
+Returns a function with the same signature as `send`. Options: `firewall`, `chainId`, `from`, `toCalls?` (map your tx shape to calls), `sessionId?`, `onApprovalRequired?` (return `{ approver }` to approve or `false` to reject; without it, `ApprovalRequiredError` is thrown), `onVerdict?` (observer; its errors are ignored), `releaseOnError?` (return true only when a send error proves nothing was broadcast). Throws `FirewallBlockedError` or `ApprovalRequiredError`, each carrying `.verdict` and a stable `.code` (`FIREWALL_BLOCKED`, `FIREWALL_APPROVAL_REQUIRED`).
+
+### Lower-level building blocks
+
+| Export | Use |
+|---|---|
+| `definePolicy(input)` / `compilePolicy(input)` | Validate a policy up front (e.g. in CI); `compilePolicy` returns the indexed, hashed form. |
+| `PolicySchema`, `TransactionRequestSchema` | The Zod schemas, for your own API validation. |
+| `decodeRequest(...)` | Decoder only: calldata → actions and decode issues. |
+| `evaluatePolicy(input)`, `riskScore(findings)` | Pure engine, no sessions or audit. |
+| `describeAction(action)` | Plain-English text for one action. |
+| `AuditLog`, `MemoryAuditSink`, `JsonlFileAuditSink`, `verifyAuditChain`, `GENESIS_HASH` | Audit logging and verification. |
+| `MemorySessionStore` | Default single-process session store. |
+| `createRpcSimulator({ url, timeoutMs?, fetch? })` | `eth_call` revert check (default timeout 1500 ms; batches reported as unavailable). |
+| `parseUnits`, `formatUnits`, `UINT256_MAX` | Amount helpers. |
+| `SELECTORS`, `PERMIT2_ADDRESS`, `UNLIMITED_APPROVAL_THRESHOLD` | Constants used by the decoder. |
+
+## Extending: custom stores and sinks
+
+### Session store
+
+```ts
+interface SessionStore {
+  transact<T>(sessionId: string, now: number, fn: (state: SessionState) => T | Promise<T>): Promise<T>;
+}
+```
+
+`transact` must load the session state (creating it with `createdAt = now` if missing), run `fn` while no other caller can touch that session, and persist the mutated state **only if `fn` resolves**. If `fn` throws, nothing may be saved. `SessionState` contains `bigint` values, so serialize them explicitly (for example as decimal strings). Typical implementations: a database row lock (`SELECT … FOR UPDATE`), Redis `WATCH`/`MULTI` with retry, or a per-session queue in a single owner process.
+
+### Audit sink
+
+```ts
+interface AuditSink {
+  append(record: AuditRecord): Promise<void>; // reject → the request is blocked
+  tail?(): Promise<AuditRecord | undefined>;   // last record, to continue the chain after restart
+}
+```
+
+`AuditRecord` is `{ seq, timestamp, type, requestId, sessionId, payload, prevHash, hash }`, where `type` is `evaluation`, `approval`, `rejection`, `commit` or `release`. Ship records to append-only storage (S3 Object Lock, a WORM bucket, a ledger table) and periodically publish the latest `hash` somewhere the host can't rewrite.
+
+## Production checklist
+
+- [ ] The agent process **cannot** reach wallet keys or wallet APIs except through the firewall.
+- [ ] `unknownContractCalls`, `unlistedAssets` and `recipients.notAllowlisted` are set to `'block'` for unattended agents.
+- [ ] Every token the agent should touch is in `tokens` with realistic `perTransactionMax` / `sessionMax`.
+- [ ] Protocols list explicit `selectors`, never "any function".
+- [ ] A durable, append-only `AuditSink` is configured, and its head hash is anchored externally.
+- [ ] A shared, locking `SessionStore` is used if more than one instance runs.
+- [ ] `commit()` / `release()` are always called (or `guard()` is used), so reservations don't leak.
+- [ ] Off-chain signing (`signTypedData`, `personal_sign`) is gated separately or disabled for agents.
+- [ ] Wallet-native limits (Safe guards, provider policies, on-chain session caps) are in place as a second layer.
+- [ ] Policies are validated in CI with `definePolicy()` and reviewed like code.
+
 ## Security model and limitations
 
 - **Typed-data signatures are out of scope.** Off-chain signatures (EIP-2612/Permit2 permits, EIP-712 marketplace orders, `personal_sign`) can authorize transfers without a transaction. Gate your wallet's `signTypedData`/`signMessage` paths separately, or deny them for agents.
@@ -184,6 +527,35 @@ Optional simulation: `createFirewall({ simulator: createRpcSimulator({ url }) })
 - **USD-denominated limits are not built in.** Limits are per token in base units, which keeps decisions deterministic and oracle-free.
 - **The defaults are single-process.** Sessions and the default audit sink are in memory; use durable implementations for production.
 - This is a policy-enforcement layer, not a substitute for contract audits, key management or wallet-level controls.
+
+## FAQ
+
+**Does it replace my wallet's own policy engine?** No. It's a pre-execution layer you control, with decoding and explanations that wallet policy engines usually lack. Keep wallet-level limits as a second, independent layer.
+
+**Does it need an RPC node?** No. Decisions use only the calldata, the policy and session state. An RPC URL is needed only if you enable the optional simulator.
+
+**Why are amounts in base units instead of USD?** To stay deterministic and oracle-free. A price feed would make the same transaction pass or fail depending on market data and adds an oracle attack surface. Set per-token caps instead.
+
+**Why does a finite `approve` count as spending?** After the approval, the spender can move those tokens without another agent transaction, so the grant is the last moment the firewall can enforce a limit.
+
+**Can an operator approve something that is blocked?** No. Only `requiresApproval` verdicts can be approved, and the approval re-checks hard limits before reserving budget.
+
+**Does it work with chains other than Base?** Yes, on any EVM chain. List the chain IDs in `chainIds` and use that chain's token addresses.
+
+**Is it an LLM?** No. Explanations are generated deterministically from the decoded calldata, so they can't be prompt-injected or hallucinated.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `PolicyValidationError` at startup | Unknown key, duplicate address across tokens/nfts/protocols, or an address both denylisted and trusted. The message names the field. |
+| Every request is `blocked` with `CHAIN_NOT_ALLOWED` | `chainId` in the request isn't in `policy.chainIds`. |
+| `UNKNOWN_CONTRACT_CALL` for a protocol you trust | Add it to `protocols`, with the exact `selectors` you use. |
+| `UNLISTED_ASSET` on a token you use | Add it to `tokens` with caps. |
+| `CALLDATA_MALFORMED` on calldata that works on-chain | The encoding isn't canonical (dirty address bits, extra bytes, unusual offsets). Re-encode with a standard ABI encoder. |
+| `TOKEN_SESSION_LIMIT` sooner than expected | Reservations from earlier `allowed` verdicts were never committed or released, or finite approvals were counted. Check `usage()`. |
+| `FirewallStateError: Reservation not found` | `commit` / `release` called twice for the same verdict. |
+| `AUDIT_UNAVAILABLE` | The audit sink rejected the write (disk full, permissions, network). The request is blocked by design. |
 
 ## Development
 
@@ -214,3 +586,7 @@ src/schemas.ts     Zod schemas for requests and policies
 ### Provenance
 
 The decoding and scoring approach is derived from ATF's `packages/compiler/risk/calldata.ts` and `risk/scoring.ts` (token-aware decoding, unlimited-approval detection, dominant-signal score aggregation). It deliberately differs where those modules failed open: unknown or malformed calldata no longer falls back to native-value-only scoring, decoding is canonical-only, batches are aggregated, and multi-chain/ZK abstractions are removed.
+
+## License
+
+No license has been chosen yet, so all rights are reserved by the copyright holder. Add a `LICENSE` file before accepting outside contributions or publishing to npm.
