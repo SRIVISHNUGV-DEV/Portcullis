@@ -1,23 +1,27 @@
 import { describe, expect, it } from 'vitest';
-import { evaluatePolicy, riskScore, type Finding, type SessionView, type SimulationOutcome } from '../src/engine.js';
+import { evaluatePolicy, riskScore, type Finding, type QuoteOutcome, type SessionView, type SimulationOutcome } from '../src/engine.js';
 import { compilePolicy } from '../src/policy.js';
 import { TransactionRequestSchema, type PolicyInput } from '../src/schemas.js';
 import {
   ALICE, BOB, MALLORY, NFT, PERMIT2_ADDRESS, ROUTER, SWAP_SELECTOR, TREASURY, UINT256_MAX,
   UNKNOWN_CONTRACT, UNKNOWN_TOKEN, USDC, WALLET, WETH, basePolicy, batch, encodeCall, erc20, erc721, eth,
-  permit2Approve, tx, usdc, walletExecute, walletExecuteBatch,
+  packPath, permit2Approve, router, tx, usdc, walletExecute, walletExecuteBatch,
 } from './helpers.js';
 
 const NOW = Date.UTC(2026, 9, 8);
 const fresh: SessionView = { createdAt: NOW, txCount: 0, spent: { native: 0n, tokens: {} } };
 
-function run(input: unknown, opts: { policy?: PolicyInput; session?: SessionView; now?: number; simulation?: SimulationOutcome } = {}) {
+function run(
+  input: unknown,
+  opts: { policy?: PolicyInput; session?: SessionView; now?: number; simulation?: SimulationOutcome; quotes?: (QuoteOutcome | null)[] } = {},
+) {
   return evaluatePolicy({
     request: TransactionRequestSchema.parse(input),
     policy: compilePolicy(opts.policy ?? basePolicy()),
     session: opts.session ?? fresh,
     now: opts.now ?? NOW,
     ...(opts.simulation ? { simulation: opts.simulation } : {}),
+    ...(opts.quotes ? { quotes: opts.quotes } : {}),
   });
 }
 
@@ -244,5 +248,115 @@ describe('determinism and scoring', () => {
     expect(r.summary).toContain(UNKNOWN_CONTRACT);
     expect(r.summary).toContain('send 0.01 ETH');
     expect(r.summary).toContain('Blocked because: Unlimited allowance');
+  });
+});
+
+describe('Uniswap router decoding', () => {
+  const MULTICALL = '0x5ae401dc';
+  const routerPolicy = (extra: Record<string, unknown> = {}) =>
+    basePolicy({
+      protocols: [{ name: 'Uniswap SwapRouter02', address: ROUTER, kind: 'uniswap-v3-router', selectors: [SWAP_SELECTOR, MULTICALL], ...extra }],
+    });
+  const swap = (recipient: string, minOut = eth('0.05')) => tx({ to: ROUTER, data: router.exactInputSingle(USDC, WETH, recipient, usdc('200'), minOut) });
+
+  it('allows a swap whose output goes to the agent wallet and explains it', () => {
+    const r = run(swap(WALLET), { policy: routerPolicy() });
+    expect(r.verdict).toBe('allowed');
+    expect(r.explanation[1]).toBe(`Swap 200 USDC for at least 0.05 WETH on Uniswap SwapRouter02 (${ROUTER}), sending the output to the agent wallet (${WALLET})`);
+  });
+
+  it('treats the msg.sender placeholder as the agent wallet', () => {
+    expect(run(swap('0x0000000000000000000000000000000000000001'), { policy: routerPolicy() }).verdict).toBe('allowed');
+  });
+
+  it('blocks a swap that sends the output to someone else', () => {
+    const r = run(swap(BOB), { policy: routerPolicy() });
+    expect(codes(r.findings, 'block')).toEqual(['SWAP_RECIPIENT_NOT_WALLET']);
+  });
+
+  it('blocks a swap with no minimum output by default', () => {
+    expect(codes(run(swap(WALLET, 0n), { policy: routerPolicy() }).findings, 'block')).toEqual(['SWAP_NO_SLIPPAGE_PROTECTION']);
+    const lenient = { ...routerPolicy(), swaps: { missingSlippageProtection: 'requireApproval' as const } };
+    expect(run(swap(WALLET, 0n), { policy: lenient }).verdict).toBe('requiresApproval');
+  });
+
+  it('decodes multicall, allowing output parked in the router only when it is withdrawn to the wallet', () => {
+    const THIS = '0x0000000000000000000000000000000000000002';
+    const parked = router.exactInputSingle(USDC, WETH, THIS, usdc('200'), eth('0.05'));
+    const ok = run(tx({ to: ROUTER, data: router.multicall(2n ** 40n, [parked, router.unwrapWETH9(eth('0.05'), WALLET)]) }), { policy: routerPolicy() });
+    expect(ok.verdict).toBe('allowed');
+    const stolen = run(tx({ to: ROUTER, data: router.multicall(2n ** 40n, [parked, router.unwrapWETH9(eth('0.05'), BOB)]) }), { policy: routerPolicy() });
+    expect(new Set(codes(stolen.findings, 'block'))).toEqual(new Set(['SWAP_RECIPIENT_NOT_WALLET']));
+    const kept = run(tx({ to: ROUTER, data: router.multicall(2n ** 40n, [parked]) }), { policy: routerPolicy() });
+    expect(codes(kept.findings, 'block')).toEqual(['SWAP_RECIPIENT_NOT_WALLET']);
+  });
+
+  it('flags router functions it cannot decode, even inside multicall', () => {
+    const unknown = `0x9b2c0a37${'00'.repeat(32)}`;
+    const r = run(tx({ to: ROUTER, data: router.multicall(2n ** 40n, [unknown]) }), { policy: routerPolicy({ selectors: undefined }) });
+    expect(codes(r.findings)).toEqual(['PROTOCOL_FUNCTION_NOT_DECODED']);
+  });
+
+  it('decodes multi-hop paths and checks every token', () => {
+    const path = packPath(USDC, 500, WETH, 3000, UNKNOWN_TOKEN);
+    const r = run(tx({ to: ROUTER, data: router.exactInput(path, WALLET, usdc('10'), 1n) }), { policy: routerPolicy({ selectors: undefined }) });
+    expect(r.decoded.actions[1]).toMatchObject({ type: 'swap', tokenIn: USDC, tokenOut: UNKNOWN_TOKEN, pools: [{ fee: 500 }, { fee: 3000 }] });
+    expect(codes(r.findings)).toEqual(['UNLISTED_ASSET']);
+    const bad = run(tx({ to: ROUTER, data: router.exactInput('0x1234', WALLET, 1n, 1n) }), { policy: routerPolicy({ selectors: undefined }) });
+    expect(codes(bad.findings, 'block')).toEqual(['CALLDATA_MALFORMED']);
+  });
+
+  it('checks the minimum output against a live quote', () => {
+    const policy = routerPolicy({ maxSlippageBps: 100 });
+    const quote = (amount: bigint): QuoteOutcome[] => [{ status: 'ok', amount }];
+    expect(run(swap(WALLET, eth('0.0495')), { policy, quotes: quote(eth('0.05')) }).verdict).toBe('allowed');
+    const r = run(swap(WALLET, eth('0.04')), { policy, quotes: quote(eth('0.05')) });
+    expect(codes(r.findings, 'block')).toEqual(['SWAP_SLIPPAGE_TOO_HIGH']);
+    expect(r.findings[0]!.message).toContain('20.00% below the current quote of 0.05 WETH');
+    expect(r.findings[0]!.remediation).toBe('Set amountOutMinimum to at least 0.0495 WETH');
+    expect(codes(run(swap(WALLET), { policy }).findings)).toEqual(['SWAP_QUOTE_UNAVAILABLE']);
+    expect(run(swap(WALLET), { policy }).verdict).toBe('requiresApproval');
+  });
+
+  it('checks the maximum input of exact-output swaps against a quote', () => {
+    const policy = routerPolicy({ maxSlippageBps: 50, selectors: undefined });
+    const input = tx({ to: ROUTER, data: router.exactOutputSingle(USDC, WETH, WALLET, eth('0.05'), usdc('210')) });
+    expect(codes(run(input, { policy, quotes: [{ status: 'ok', amount: usdc('200') }] }).findings, 'block')).toEqual(['SWAP_SLIPPAGE_TOO_HIGH']);
+    expect(run(input, { policy, quotes: [{ status: 'ok', amount: usdc('209') }] }).verdict).toBe('allowed');
+  });
+
+  it('rejects maxSlippageBps on protocols it cannot decode', () => {
+    expect(() => compilePolicy(basePolicy({ protocols: [{ name: 'R', address: ROUTER, maxSlippageBps: 50 }] }))).toThrow(/needs a decodable kind/);
+  });
+});
+
+describe('per-recipient windows', () => {
+  const HOUR = 3_600_000;
+  const policy = basePolicy({
+    tokens: [{ address: USDC, symbol: 'USDC', decimals: 6, perTransactionMax: usdc('100'), sessionMax: usdc('5000'), requireApprovalAbove: usdc('50'), perRecipient: { windowSeconds: 86_400, max: usdc('300') } }],
+  });
+  const pay = (amount: string, to = ALICE) => tx({ to: USDC, data: erc20.transfer(to, usdc(amount)) });
+  const sent = (amount: string, at: number, approved = false, to = ALICE) => ({ asset: USDC, to, amount: usdc(amount), at, ...(approved ? { approved } : {}) });
+
+  it('sums split payments to one recipient against the review threshold', () => {
+    expect(run(pay('49'), { policy }).verdict).toBe('allowed');
+    const r = run(pay('49'), { policy, session: { ...fresh, recentFlows: [sent('49', NOW - HOUR)] } });
+    expect(codes(r.findings)).toEqual(['RECIPIENT_WINDOW_THRESHOLD']);
+    expect(r.findings[0]!.message).toBe(`${ALICE} would receive 98 USDC without review within 1 day, above the 50 USDC review threshold (payments to one recipient are summed)`);
+  });
+
+  it('ignores other recipients, transfers outside the window and approved amounts for the threshold', () => {
+    const recentFlows = [sent('49', NOW - 25 * HOUR), sent('49', NOW - HOUR, false, BOB), sent('75', NOW - HOUR, true)];
+    expect(run(pay('49'), { policy, session: { ...fresh, recentFlows } }).verdict).toBe('allowed');
+  });
+
+  it('enforces the hard window cap including approved amounts', () => {
+    const recentFlows = [sent('100', NOW - HOUR, true), sent('100', NOW - HOUR, true), sent('75', NOW - HOUR, true)];
+    expect(codes(run(pay('30'), { policy, session: { ...fresh, recentFlows } }).findings, 'block')).toEqual(['RECIPIENT_WINDOW_LIMIT']);
+  });
+
+  it('requires a threshold or cap', () => {
+    const bad = basePolicy({ native: { perTransactionMax: 1n, sessionMax: 1n, perRecipient: { windowSeconds: 60 } } });
+    expect(() => compilePolicy(bad)).toThrow(/perRecipient needs requireApprovalAbove or max/);
   });
 });

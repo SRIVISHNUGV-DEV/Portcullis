@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MemoryAuditSink, verifyAuditChain, type AuditRecord, type AuditSink } from '../src/audit.js';
+import type { SwapAction } from '../src/decoder.js';
 import { createFirewall, FirewallStateError } from '../src/firewall.js';
 import { PolicyValidationError } from '../src/policy.js';
+import { encodeRoleKey, flattenConditions, toZodiacRoles } from '../src/zodiac.js';
 import type { SessionStore } from '../src/session.js';
-import { ALICE, BOB, ROUTER, USDC, basePolicy, erc20, fixedEnv, tx, usdc } from './helpers.js';
+import { ALICE, BOB, ROUTER, SWAP_SELECTOR, USDC, WALLET, WETH, basePolicy, erc20, eth, fixedEnv, router, tx, usdc } from './helpers.js';
 
 function setup(overrides: Parameters<typeof createFirewall>[0] extends infer O ? Partial<O> : never = {}) {
   const env = fixedEnv();
@@ -184,5 +186,93 @@ describe('simulation hook', () => {
   it('keeps unrelated protocol approvals unaffected', async () => {
     const { firewall } = setup();
     expect((await firewall.evaluate(tx({ to: USDC, data: erc20.approve(ROUTER, usdc('100')) }))).allowed).toBe(true);
+  });
+});
+
+describe('per-recipient windows', () => {
+  const windowPolicy = () =>
+    basePolicy({
+      tokens: [{ address: USDC, symbol: 'USDC', decimals: 6, perTransactionMax: usdc('100'), sessionMax: usdc('5000'), requireApprovalAbove: usdc('50'), perRecipient: { windowSeconds: 3600 } }],
+    });
+
+  it('counts reserved and committed chunks, excludes approved ones and forgets old ones', async () => {
+    const { firewall, env } = setup({ policy: windowPolicy() });
+    const first = await firewall.evaluate(transfer('30'));
+    expect(first.allowed).toBe(true);
+    expect((await firewall.evaluate(transfer('30'))).verdict).toBe('requiresApproval');
+    await firewall.commit(first, { txHash: '0x01' });
+    expect((await firewall.evaluate(transfer('30'))).reasons.map((r) => r.code)).toEqual(['RECIPIENT_WINDOW_THRESHOLD']);
+    expect((await firewall.evaluate(transfer('30', BOB))).allowed).toBe(true);
+
+    const pending = await firewall.evaluate(transfer('75'));
+    const approved = await firewall.approve(pending, { approver: 'ops' });
+    await firewall.commit(approved);
+    expect((await firewall.evaluate(transfer('20'))).allowed).toBe(true);
+
+    env.advance(3_601_000);
+    expect((await firewall.evaluate(transfer('45'))).allowed).toBe(true);
+  });
+
+  it('releases a chunk from the window when it is not sent', async () => {
+    const { firewall } = setup({ policy: windowPolicy() });
+    const first = await firewall.evaluate(transfer('40'));
+    await firewall.release(first);
+    expect((await firewall.evaluate(transfer('40'))).allowed).toBe(true);
+  });
+});
+
+describe('swap quotes', () => {
+  const policy = () =>
+    basePolicy({ protocols: [{ name: 'Uniswap SwapRouter02', address: ROUTER, kind: 'uniswap-v3-router', selectors: [SWAP_SELECTOR], maxSlippageBps: 100 }] });
+  const swap = (minOut: bigint) => tx({ to: ROUTER, data: router.exactInputSingle(USDC, WETH, WALLET, usdc('200'), minOut) });
+
+  it('quotes swaps, blocks excessive slippage and reuses the quote on approval', async () => {
+    const quoter = vi.fn(async (_swap: SwapAction) => ({ status: 'ok' as const, amount: eth('0.05') }));
+    const { firewall } = setup({ policy: policy(), quoter });
+    expect((await firewall.evaluate(swap(eth('0.0499')))).allowed).toBe(true);
+    expect(quoter).toHaveBeenCalledTimes(1);
+    expect(quoter.mock.calls[0]![0]).toMatchObject({ type: 'swap', tokenIn: USDC, tokenOut: WETH, amountIn: usdc('200') });
+    expect((await firewall.evaluate(swap(eth('0.04')))).reasons.map((r) => r.code)).toEqual(['SWAP_SLIPPAGE_TOO_HIGH']);
+    expect((await firewall.evaluate(swap(eth('0.04')))).verdict).toBe('blocked');
+    expect((await firewall.evaluate(tx({ to: USDC, data: erc20.transfer(ALICE, usdc('1')) }))).allowed).toBe(true);
+    expect(quoter).toHaveBeenCalledTimes(3);
+  });
+
+  it('treats a failing quoter as unavailable', async () => {
+    const { firewall } = setup({ policy: policy(), quoter: async () => { throw new Error('quoter down'); } });
+    const v = await firewall.evaluate(swap(eth('0.0499')));
+    expect(v.verdict).toBe('requiresApproval');
+    expect(v.reasons[0]!.message).toContain('quoter down');
+    const approved = await firewall.approve(v, { approver: 'ops' });
+    expect(approved.allowed).toBe(true);
+  });
+});
+
+describe('toZodiacRoles', () => {
+  const ROLES = '0x00000000000000000000000000000000000001e5';
+
+  it('encodes role names and flattens conditions breadth-first', () => {
+    expect(encodeRoleKey('agent')).toBe(`0x6167656e74${'0'.repeat(54)}`);
+    expect(() => encodeRoleKey('x'.repeat(33))).toThrow(/1-32 bytes/);
+    const flat = flattenConditions({
+      paramType: 5, operator: 5,
+      children: [{ paramType: 0, operator: 2, children: [{ paramType: 1, operator: 16, compValue: '0x01' }, { paramType: 1, operator: 16, compValue: '0x02' }] }, { paramType: 1, operator: 0 }],
+    });
+    expect(flat.map(([parent]) => parent)).toEqual([0, 0, 0, 1, 1]);
+  });
+
+  it('maps tokens, protocols and members, and lists what stays firewall-only', () => {
+    const plan = toZodiacRoles(basePolicy({ recipients: { allow: [ALICE] } }), { roles: ROLES, role: 'agent', members: [BOB] });
+    expect(plan.calls.every((c) => c.to === ROLES)).toBe(true);
+    expect(plan.allowances.map((a) => a.asset)).toEqual([USDC, WETH, 'native']);
+    expect(plan.calls.at(-1)!.data.startsWith('0x957ed2b3')).toBe(true);
+    expect(plan.warnings.join(' ')).toMatch(/Review thresholds/);
+    expect(plan.warnings.join(' ')).toMatch(/NFT rules are not mapped/);
+  });
+
+  it('does not grant native transfers without a recipient allowlist', () => {
+    const plan = toZodiacRoles(basePolicy(), { roles: ROLES, role: 'agent' });
+    expect(plan.allowances.some((a) => a.asset === 'native')).toBe(false);
+    expect(plan.warnings.join(' ')).toMatch(/ETH transfers are not allowed onchain/);
   });
 });

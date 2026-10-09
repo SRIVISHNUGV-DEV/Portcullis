@@ -29,6 +29,7 @@ const USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 const WETH = '0x4200000000000000000000000000000000000006';
 const ROUTER = '0x2626664c2603336e57b271c5c0b26f421741e481'; // Uniswap SwapRouter02 on Base
 const EXACT_INPUT_SINGLE = '0x04e45aaf';
+const QUOTER_V2 = '0x3d4e44eb1374240ce5f1b871ab261cd16335b76a'; // Uniswap QuoterV2 on Base
 const USDC_BALANCE_SLOT = 9; // FiatTokenV2 balanceAndBlacklistStates mapping
 
 rmSync(join(dir, 'data'), { recursive: true, force: true });
@@ -64,9 +65,9 @@ const secret = (name) => {
   writeFileSync(join(dir, `${name}.token`), token, { mode: 0o600 });
   return hashToken(token);
 };
-const usdcRule = (perTx, session, approvalAbove) => ({
+const usdcRule = (perTx, session, approvalAbove, extra = {}) => ({
   address: USDC, symbol: 'USDC', decimals: 6,
-  perTransactionMax: parseUnits(perTx, 6), sessionMax: parseUnits(session, 6), requireApprovalAbove: parseUnits(approvalAbove, 6),
+  perTransactionMax: parseUnits(perTx, 6), sessionMax: parseUnits(session, 6), requireApprovalAbove: parseUnits(approvalAbove, 6), ...extra,
 });
 const strict = { unknownContractCalls: 'block', unlistedAssets: 'block' };
 
@@ -76,13 +77,14 @@ const config = {
   listen: { host: '127.0.0.1', port: Number(values.port) },
   adminTokenSha256: secret('admin'),
   storage: { dir: join(dir, 'data'), fsync: true },
+  quoter: { uniswapV3QuoterV2: QUOTER_V2 },
   agents: [
     {
       id: 'payments-bot', tokenSha256: secret('payments-bot'), wallet: payments,
       policy: {
         version: 1, name: 'payments-bot', chainIds: [CHAIN], ...strict,
         native: { perTransactionMax: 0n, sessionMax: 0n },
-        tokens: [usdcRule('100', '500', '50')],
+        tokens: [usdcRule('100', '500', '50', { perRecipient: { windowSeconds: 86_400 } })],
       },
     },
     {
@@ -94,7 +96,7 @@ const config = {
           usdcRule('1000', '3000', '500'),
           { address: WETH, symbol: 'WETH', decimals: 18, perTransactionMax: parseUnits('1', 18), sessionMax: parseUnits('2', 18) },
         ],
-        protocols: [{ name: 'Uniswap SwapRouter02', address: ROUTER, selectors: [EXACT_INPUT_SINGLE], maxNativeValue: 0n }],
+        protocols: [{ name: 'Uniswap SwapRouter02', address: ROUTER, kind: 'uniswap-v3-router', selectors: [EXACT_INPUT_SINGLE], maxNativeValue: 0n, maxSlippageBps: 100 }],
         approvals: { spenders: [ROUTER] },
       },
     },

@@ -81,6 +81,23 @@ export const walletExecuteBatch = (calls: Array<[string, bigint, string]>) =>
 /** exactInputSingle on Uniswap's SwapRouter02. */
 export const SWAP_SELECTOR = '0x04e45aaf';
 
+const SWAP_SINGLE = T.tuple(T.address, T.address, T.uint24, T.address, T.uint256, T.uint256, T.uint160);
+
+export const router = {
+  exactInputSingle: (tokenIn: string, tokenOut: string, recipient: string, amountIn: bigint, amountOutMinimum: bigint, fee = 500n) =>
+    encodeCall(SWAP_SELECTOR, [SWAP_SINGLE], [[tokenIn, tokenOut, fee, recipient, amountIn, amountOutMinimum, 0n]]),
+  exactOutputSingle: (tokenIn: string, tokenOut: string, recipient: string, amountOut: bigint, amountInMaximum: bigint, fee = 500n) =>
+    encodeCall('0x5023b4df', [SWAP_SINGLE], [[tokenIn, tokenOut, fee, recipient, amountOut, amountInMaximum, 0n]]),
+  /** Packed path: token, fee, token, … */
+  exactInput: (path: string, recipient: string, amountIn: bigint, amountOutMinimum: bigint) =>
+    encodeCall('0xb858183f', [T.tuple(T.bytes, T.address, T.uint256, T.uint256)], [[path, recipient, amountIn, amountOutMinimum]]),
+  unwrapWETH9: (amountMinimum: bigint, recipient: string) => encodeCall('0x49404b7c', [T.uint256, T.address], [amountMinimum, recipient]),
+  multicall: (deadline: bigint, calls: string[]) => encodeCall('0x5ae401dc', [T.uint256, T.array(T.bytes)], [deadline, calls]),
+};
+
+export const packPath = (...parts: (string | number)[]) =>
+  `0x${parts.map((x) => (typeof x === 'number' ? x.toString(16).padStart(6, '0') : x.slice(2))).join('')}`;
+
 export function basePolicy(overrides: Partial<PolicyInput> = {}): PolicyInput {
   return {
     version: 1,
