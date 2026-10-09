@@ -24,6 +24,9 @@ export type { AuditEventType, AuditRecord, AuditSink, ChainVerification } from '
 export { MemorySessionStore } from './session.js';
 export type { PendingApproval, Reservation, SessionState, SessionStore } from './session.js';
 
+export { GroupCommitFile, JournalSessionStore } from './storage.js';
+export type { GroupCommitOptions } from './storage.js';
+
 export { createRpcSimulator } from './simulation.js';
 export type { RpcSimulatorOptions, Simulator } from './simulation.js';
 

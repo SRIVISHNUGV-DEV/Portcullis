@@ -24,8 +24,11 @@ import type { Simulator } from './simulation.js';
 export interface FirewallOptions {
   /** Policy definition (validated at construction; invalid policies throw) or a compiled policy. */
   readonly policy: PolicyInput | CompiledPolicy;
-  /** Audit destination. Defaults to an in-memory sink; use a durable sink in production. */
-  readonly audit?: AuditSink;
+  /**
+   * Audit destination. Defaults to an in-memory sink; use a durable sink in production.
+   * Pass an AuditLog to share one hash chain between several firewalls.
+   */
+  readonly audit?: AuditSink | AuditLog;
   /** Session usage store. Defaults to in-process memory (single instance only). */
   readonly sessions?: SessionStore;
   readonly simulator?: Simulator;
@@ -99,7 +102,7 @@ export class Firewall {
   constructor(options: FirewallOptions) {
     this.policy = isCompiled(options.policy) ? options.policy : compilePolicy(options.policy);
     this.clock = options.clock ?? Date.now;
-    this.audit = new AuditLog(options.audit ?? new MemoryAuditSink(), this.clock);
+    this.audit = options.audit instanceof AuditLog ? options.audit : new AuditLog(options.audit ?? new MemoryAuditSink(), this.clock);
     this.sessions = options.sessions ?? new MemorySessionStore();
     this.simulator = options.simulator;
     this.generateId = options.generateId ?? randomUUID;
@@ -137,7 +140,7 @@ export class Firewall {
         }
         simulation = await this.simulate(request);
       }
-      return await this.sessions.transact(sessionId, now, async (state) => {
+      const outcome = await this.sessions.transact(sessionId, now, async (state) => {
         const result = this.run(request, state, now, simulation);
         let reservationId: string | undefined;
         let approvalExpiresAt: number | undefined;
@@ -151,15 +154,32 @@ export class Firewall {
         }
         for (const [id, a] of Object.entries(state.approvals)) if (a.expiresAt < now) delete state.approvals[id];
         const durationMs = performance.now() - started;
-        const auditHash = await this.record('evaluation', requestId, sessionId, {
+        const audit = await this.prepareRecord('evaluation', requestId, sessionId, {
           txDigest, request, result: auditSummary(result), reservationId, simulation, durationMs,
         });
-        return this.verdict({
-          requestId, sessionId, request, txDigest, result, now, durationMs, auditHash,
+        const verdict = this.verdict({
+          requestId, sessionId, request, txDigest, result, now, durationMs, auditHash: audit.hash,
           ...(reservationId ? { reservationId } : {}),
           ...(approvalExpiresAt !== undefined ? { approvalExpiresAt } : {}),
         });
+        return { verdict, persisted: audit.persisted, reservationId };
       });
+      try {
+        await outcome.persisted;
+      } catch (e) {
+        // The decision never reached the audit log: undo its reservation or pending approval.
+        await this.sessions
+          .transact(sessionId, now, (state) => {
+            if (outcome.reservationId && state.pending[outcome.reservationId]) {
+              delete state.pending[outcome.reservationId];
+              state.txCount = Math.max(0, state.txCount - 1);
+            }
+            delete state.approvals[requestId];
+          })
+          .catch(() => undefined);
+        throw e;
+      }
+      return deepFreeze({ ...outcome.verdict, durationMs: round(performance.now() - started) });
     } catch (e) {
       const audit = e instanceof AuditUnavailableError;
       return this.failure(
@@ -233,13 +253,15 @@ export class Firewall {
   /** Mark an allowed request as executed; its reservation becomes committed spend. */
   async commit(allowed: Verdict, receipt: { readonly txHash?: string } = {}): Promise<void> {
     const reservationId = requireReservation(allowed);
-    await this.sessions.transact(allowed.sessionId, this.clock(), async (state) => {
+    const { persisted } = await this.sessions.transact(allowed.sessionId, this.clock(), async (state) => {
       const r = state.pending[reservationId];
       if (!r) throw new FirewallStateError('Reservation not found (already committed or released)');
-      await this.record('commit', allowed.requestId, allowed.sessionId, { reservationId, txHash: receipt.txHash });
+      const audit = await this.prepareRecord('commit', allowed.requestId, allowed.sessionId, { reservationId, txHash: receipt.txHash });
       delete state.pending[reservationId];
       state.committed = addSpend(state.committed, r.spend);
+      return { persisted: audit.persisted };
     });
+    await persisted;
   }
 
   /** Release an allowed request that was not sent or failed before broadcast, returning its budget. */
@@ -282,11 +304,26 @@ export class Firewall {
   }
 
   private async record(type: AuditEventType, requestId: string, sessionId: string, payload: Record<string, unknown>): Promise<string> {
+    const { hash, persisted } = await this.prepareRecord(type, requestId, sessionId, payload);
+    await persisted;
+    return hash;
+  }
+
+  /** Chain an audit record now; `persisted` rejects with AuditUnavailableError if storing it fails. */
+  private async prepareRecord(
+    type: AuditEventType, requestId: string, sessionId: string, payload: Record<string, unknown>,
+  ): Promise<{ hash: string; persisted: Promise<void> }> {
+    let prepared: Awaited<ReturnType<AuditLog['prepare']>>;
     try {
-      return (await this.audit.record(type, requestId, sessionId, { policyHash: this.policy.hash, ...payload })).hash;
+      prepared = await this.audit.prepare(type, requestId, sessionId, { policyHash: this.policy.hash, ...payload });
     } catch {
       throw new AuditUnavailableError();
     }
+    const persisted = prepared.persisted.catch(() => {
+      throw new AuditUnavailableError();
+    });
+    persisted.catch(() => undefined);
+    return { hash: prepared.record.hash, persisted };
   }
 
   private async finalizeUnreserved(
