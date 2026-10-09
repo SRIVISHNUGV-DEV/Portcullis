@@ -589,4 +589,4 @@ The decoding and scoring approach is derived from ATF's `packages/compiler/risk/
 
 ## License
 
-No license has been chosen yet, so all rights are reserved by the copyright holder. Add a `LICENSE` file before accepting outside contributions or publishing to npm.
+Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 Corven Labs.

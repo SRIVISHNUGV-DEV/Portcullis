@@ -4,7 +4,7 @@
   "description": "Pre-execution safety and risk gate for autonomous onchain agents: decodes EVM calldata, enforces token-aware policy and explains every verdict before a transaction reaches the agent wallet.",
   "type": "module",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=20"
   },
