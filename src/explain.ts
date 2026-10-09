@@ -91,6 +91,15 @@ export function describeAction(action: Action, policy: CompiledPolicy, wallet: s
       return action.approved
         ? `Grant ${l(action.operator)} control of ALL tokens in ${l(action.collection)} (setApprovalForAll)`
         : `Revoke ${l(action.operator)}'s operator access to ${l(action.collection)}`;
+    case 'swap': {
+      const route = action.pools.length > 1 ? ` via ${action.pools.length} pools` : '';
+      const amounts = action.exact === 'input'
+        ? `${formatTokenAmount(policy, action.tokenIn, action.amountIn)} for at least ${formatTokenAmount(policy, action.tokenOut, action.amountOut)}`
+        : `at most ${formatTokenAmount(policy, action.tokenIn, action.amountIn)} for exactly ${formatTokenAmount(policy, action.tokenOut, action.amountOut)}`;
+      return `Swap ${amounts} on ${l(action.router)}${route}, sending the output to ${l(action.recipient)}`;
+    }
+    case 'router_withdrawal':
+      return `Withdraw ${action.token ? tokenName(policy, action.token) : 'unwrapped WETH as ETH'} held by ${l(action.router)} to ${l(action.recipient)}`;
     case 'contract_call':
       return withValue(
         policy,
@@ -110,6 +119,13 @@ function expiry(seconds: bigint): string {
   if (seconds === 0n) return 'at the end of the block (Permit2 default)';
   if (seconds >= 253_402_300_800n) return 'never (far-future expiration)';
   return new Date(Number(seconds) * 1000).toISOString();
+}
+
+export function formatDuration(seconds: number): string {
+  const units: [number, string][] = [[86_400, 'day'], [3_600, 'hour'], [60, 'minute'], [1, 'second']];
+  const [size, name] = units.find(([n]) => seconds % n === 0)!;
+  const count = seconds / size;
+  return `${count} ${name}${count === 1 ? '' : 's'}`;
 }
 
 export function joinSentences(items: readonly string[]): string {

@@ -5,13 +5,14 @@
 // counted until committed (executed) or released (failed / not sent): an
 // unresolved reservation fails closed by consuming budget.
 
-import type { SimulationOutcome, Spend } from './engine.js';
+import type { Flow, QuoteOutcome, SimulationOutcome, Spend } from './engine.js';
 import type { NormalizedRequest } from './schemas.js';
 
 export interface Reservation {
   readonly spend: Spend;
   readonly createdAt: number;
   readonly requestId: string;
+  readonly flows?: readonly Flow[];
 }
 
 export interface PendingApproval {
@@ -20,6 +21,7 @@ export interface PendingApproval {
   readonly expiresAt: number;
   /** Simulation outcome at evaluation time, reused when the approval is granted. */
   readonly simulation?: SimulationOutcome;
+  readonly quotes?: readonly (QuoteOutcome | null)[];
 }
 
 export interface SessionState {
@@ -29,6 +31,8 @@ export interface SessionState {
   committed: Spend;
   pending: Record<string, Reservation>;
   approvals: Record<string, PendingApproval>;
+  /** Committed transfers still inside a per-recipient window. Absent in states stored by older versions. */
+  recentFlows?: Flow[];
 }
 
 /**
@@ -42,13 +46,20 @@ export interface SessionStore {
 }
 
 export function newSessionState(id: string, now: number): SessionState {
-  return { id, createdAt: now, txCount: 0, committed: { native: 0n, tokens: {} }, pending: {}, approvals: {} };
+  return { id, createdAt: now, txCount: 0, committed: { native: 0n, tokens: {} }, pending: {}, approvals: {}, recentFlows: [] };
 }
 
 export function addSpend(a: Spend, b: Spend): Spend {
   const tokens: Record<string, bigint> = { ...a.tokens };
   for (const [k, v] of Object.entries(b.tokens)) tokens[k] = (tokens[k] ?? 0n) + v;
   return { native: a.native + b.native, tokens };
+}
+
+/** Committed recent transfers plus those of pending reservations. */
+export function recentFlows(state: SessionState): Flow[] {
+  const flows = [...(state.recentFlows ?? [])];
+  for (const r of Object.values(state.pending)) if (r.flows) flows.push(...r.flows);
+  return flows;
 }
 
 /** Committed plus all pending reservations. */

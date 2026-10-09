@@ -26,6 +26,7 @@ verdict: "allowed" | "blocked" | "requiresApproval"
 - [Wallet integrations](#wallet-integrations)
 - [MCP gateway for multiple agents](#mcp-gateway-for-multiple-agents)
 - [Latency](#latency)
+- [Onchain enforcement with Zodiac Roles](#onchain-enforcement-with-zodiac-roles)
 - [API reference](#api-reference)
 - [Extending: custom stores and sinks](#extending-custom-stores-and-sinks)
 - [Production checklist](#production-checklist)
@@ -238,6 +239,7 @@ Verdicts are frozen, plain JSON (amounts are base-unit decimal strings). Policy 
 | Revocations | `approve(…, 0)`, `decreaseAllowance`, `setApprovalForAll(…, false)` | Allowed |
 | NFTs | ERC-721 `transferFrom`/`safeTransferFrom`/`approve`, ERC-1155 single/batch transfers, `setApprovalForAll` | Collection rules; operator approvals to untrusted operators blocked by default |
 | Smart-wallet wrappers | `execute(address,uint256,bytes)` and `executeBatch((address,uint256,bytes)[])` called on the agent's own wallet | Unwrapped recursively (depth-limited); other self-calls → **blocked** |
+| Uniswap SwapRouter02 (protocols with `kind: 'uniswap-v3-router'`) | `exactInputSingle`, `exactInput`, `exactOutputSingle`, `exactOutput`, `multicall` (all three variants, one level), `unwrapWETH9`, `sweepToken`, `refundETH` | Output must reach the agent wallet; both tokens must be listed; no minimum output → **blocked** by default; minimum output checked against a live quote when `maxSlippageBps` is set; other router functions → `unknownContractCalls` |
 | Other | Unknown selectors, fallback calls, contract deployment | Policy modes (default: approval / approval / blocked) |
 
 `transferFrom` and `approve` share selectors between ERC-20 and ERC-721. Contracts listed in `nfts` are decoded as ERC-721; everything else is treated as ERC-20, and unlisted contracts go through the `unlistedAssets` rule with the ambiguity stated in the explanation.
@@ -256,11 +258,14 @@ const policy = definePolicy({
   tokens: [
     { address: USDC, symbol: 'USDC', decimals: 6,
       perTransactionMax: parseUnits('500', 6), sessionMax: parseUnits('2000', 6),
-      requireApprovalAbove: parseUnits('100', 6), maxApproval: parseUnits('500', 6) },
+      requireApprovalAbove: parseUnits('100', 6), maxApproval: parseUnits('500', 6),
+      perRecipient: { windowSeconds: 86_400 } }, // chunks to one recipient within a day are summed
     { address: WETH, symbol: 'WETH', decimals: 18, perTransactionMax: parseUnits('0.1', 18), sessionMax: parseUnits('0.5', 18),
       allowedFunctions: ['0xd0e30db0', '0x2e1a7d4d'] }, // deposit(), withdraw(uint256)
   ],
-  protocols: [{ name: 'Uniswap SwapRouter02', address: ROUTER, selectors: ['0x04e45aaf'], maxNativeValue: parseUnits('0.05', 18) }],
+  protocols: [{ name: 'Uniswap SwapRouter02', address: ROUTER, kind: 'uniswap-v3-router', selectors: ['0x04e45aaf'],
+                 maxNativeValue: parseUnits('0.05', 18), maxSlippageBps: 100 }],
+  swaps: { missingSlippageProtection: 'block', quoteUnavailable: 'requireApproval' },
   approvals: { spenders: [PERMIT2_ADDRESS], unknownSpender: 'requireApproval', operatorApprovals: 'block' },
   recipients: { allow: [TREASURY, VENDOR], notAllowlisted: 'requireApproval' },
   denylist: [KNOWN_DRAINER],
@@ -276,6 +281,7 @@ const policy = definePolicy({
 Accounting rules worth knowing:
 
 - **Per-transaction caps apply to the whole request.** Batched or nested calls are summed, so splitting one transfer into many calls doesn't evade the cap.
+- **Split payments across requests are summed per recipient** when `perRecipient` is set. Transfers to one address within `windowSeconds` (reserved or committed) count toward the review threshold, except amounts a human approved; `max` caps the window total including approved amounts.
 - **Finite approvals count as spend when granted.** Once approved, a spender (router, Permit2, marketplace) can move the funds without another agent transaction, so the grant is the last point the firewall can enforce. Re-approving the same spender is counted again; this is deliberately conservative.
 - **Third-party pulls count.** `transferFrom` and EIP-3009 transfers out of a treasury count against limits even though the funds don't leave the agent wallet.
 - Allowlisted protocols are trusted spenders automatically. Tokens and collections cannot also be protocols, because unrestricted selectors would bypass their limits; use `allowedFunctions` instead.
@@ -293,6 +299,7 @@ Amounts accept `bigint`, a base-unit decimal string (`"500000000"`), a `0x` hex 
 | `native.perTransactionMax` | amount | required | Max native value per request, summed across all calls. |
 | `native.sessionMax` | amount | required | Max native value per session (committed + reserved). |
 | `native.requireApprovalAbove` | amount | — | Within caps but above this → human approval. |
+| `native.perRecipient` | RecipientWindow | — | Rolling per-recipient limit (see below). |
 | `tokens[]` | TokenRule | `[]` | Configured ERC-20s (see below). |
 | `nfts[]` | NftRule | `[]` | Configured ERC-721/1155 collections. |
 | `protocols[]` | ProtocolRule | `[]` | Allowlisted contracts the agent may call. |
@@ -305,6 +312,8 @@ Amounts accept `bigint`, a base-unit decimal string (`"500000000"`), a `0x` hex 
 | `unlistedAssets` | Mode | `'requireApproval'` | Token or collection not configured. |
 | `unknownContractCalls` | Mode | `'requireApproval'` | Non-allowlisted contract, unrecognized function, or disallowed selector. |
 | `contractDeployment` | Mode | `'block'` | Calls with no `to` (contract creation). |
+| `swaps.missingSlippageProtection` | Mode | `'block'` | Decoded swap with `amountOutMinimum` 0 (or unbounded `amountInMaximum`). |
+| `swaps.quoteUnavailable` | Mode | `'requireApproval'` | `maxSlippageBps` is set but no quote could be obtained. |
 | `session.maxDurationSeconds` | int | — | Session older than this → `SESSION_EXPIRED`. |
 | `session.maxTransactions` | int | — | Max allowed/approved requests per session. |
 | `limits.maxCalls` | 1–256 | `16` | Max effective calls after unwrapping. |
@@ -323,10 +332,13 @@ Amounts accept `bigint`, a base-unit decimal string (`"500000000"`), a `0x` hex 
 | `requireApprovalAbove` | — | Above this (within caps) → human approval. |
 | `maxApproval` | `perTransactionMax` | Largest single allowance grant. |
 | `allowedFunctions` | `[]` | Extra selectors allowed on the token, e.g. WETH `deposit()` `0xd0e30db0`. |
+| `perRecipient` | — | Rolling per-recipient limit (see below). |
+
+**RecipientWindow**: `windowSeconds` (required); `requireApprovalAbove` (defaults to the rule's own; total sent to one recipient without review within the window, above which → human approval); `max` (hard cap on the window total, approved amounts included). At least one threshold is required.
 
 **NftRule**: `address`, `name`, `standard` (`'erc721'` \| `'erc1155'`), `allowTransfers` (default `false`; when false, transfers out need approval).
 
-**ProtocolRule**: `name`, `address`, `selectors` (omit to allow any function, at least one if set), `maxNativeValue` (max native value per call).
+**ProtocolRule**: `name`, `address`, `selectors` (omit to allow any function, at least one if set), `maxNativeValue` (max native value per call), `kind` (`'uniswap-v3-router'` decodes SwapRouter02 calls, see [What it decodes](#what-it-decodes)), `maxSlippageBps` (0–5000; largest accepted gap between a swap's limit and a live quote; needs `kind` and a `quoter`).
 
 Validation rejects, with `PolicyValidationError`: unknown keys, an address configured twice (token, collection or protocol), and an address that is both denylisted and trusted.
 
@@ -355,6 +367,9 @@ Each finding in `verdict.reasons` has a `code`, an `outcome` (`block`, `requireA
 | `SESSION_TX_LIMIT` | block | high | `session.maxTransactions` reached. |
 | `PROTOCOL_VALUE_EXCEEDED` | block | high | Native value over a protocol's `maxNativeValue`. |
 | `SIMULATION_REVERTED` | block | critical | `eth_call` reverted. |
+| `SWAP_RECIPIENT_NOT_WALLET` | block | critical | Decoded swap or router withdrawal sends output anywhere but the agent wallet. |
+| `SWAP_SLIPPAGE_TOO_HIGH` | block | high | Swap's minimum output (or maximum input) is further from the live quote than `maxSlippageBps`. |
+| `RECIPIENT_WINDOW_LIMIT` | block | high | Window total to one recipient would exceed `perRecipient.max`. |
 | `OPERATOR_APPROVAL` | mode `approvals.operatorApprovals` | critical | `setApprovalForAll(…, true)` to an untrusted operator. |
 | `CONTRACT_DEPLOYMENT` | mode `contractDeployment` | critical | Contract creation. |
 | `UNTRUSTED_SPENDER` | mode `approvals.unknownSpender` | high | Approval to an untrusted spender. |
@@ -363,9 +378,13 @@ Each finding in `verdict.reasons` has a `code`, an `outcome` (`block`, `requireA
 | `UNKNOWN_CONTRACT_CALL` | mode `unknownContractCalls` | high | Call to a contract that isn't allowlisted. |
 | `UNRECOGNIZED_TOKEN_FUNCTION` | mode `unknownContractCalls` | high | Function on a token that isn't a transfer/approval or in `allowedFunctions`. |
 | `PROTOCOL_FUNCTION_NOT_ALLOWED` | mode `unknownContractCalls` | high | Selector not in a protocol's `selectors`. |
+| `PROTOCOL_FUNCTION_NOT_DECODED` | mode `unknownContractCalls` | high | Router function (top level or inside `multicall`) the decoder doesn't understand. |
+| `SWAP_NO_SLIPPAGE_PROTECTION` | mode `swaps.missingSlippageProtection` | high | Swap with no minimum output or no maximum input. |
+| `SWAP_QUOTE_UNAVAILABLE` | mode `swaps.quoteUnavailable` | medium | `maxSlippageBps` set but no quote (no quoter, RPC error, no pool). |
 | `SIMULATION_UNAVAILABLE` | mode `simulation.onUnavailable` | medium | Simulator couldn't run. |
 | `BURN_ADDRESS_RECIPIENT` | requireApproval | high | Transfer to the zero address. |
 | `NATIVE_APPROVAL_THRESHOLD` / `TOKEN_APPROVAL_THRESHOLD` | requireApproval | medium | Above `requireApprovalAbove`. |
+| `RECIPIENT_WINDOW_THRESHOLD` | requireApproval | medium | Unreviewed total to one recipient within the window would exceed the review threshold. |
 | `NFT_TRANSFER_NOT_PREAPPROVED` | requireApproval | medium | Transfer from a collection with `allowTransfers: false`. |
 | `THIRD_PARTY_SOURCE` / `THIRD_PARTY_OWNER` | info | medium | Funds pulled from, or an approval granted on behalf of, an address other than `from`. |
 | `ALLOWANCE_REVOKED` / `ALLOWANCE_DECREASED` / `OPERATOR_REVOKED` | info | low | Risk-reducing actions; always allowed. |
@@ -443,6 +462,8 @@ For EIP-4337 or EIP-7702 smart accounts, evaluate the **inner calls** (`calls: [
 
 Optional simulation: `createFirewall({ simulator: createRpcSimulator({ url }) })` runs an `eth_call` revert check only for requests that aren't already blocked. Reverts are blocked; RPC failures and batches apply `policy.simulation.onUnavailable`. Treat RPC URLs containing API keys as secrets.
 
+Optional swap quotes: `createFirewall({ quoter: createUniswapV3Quoter({ url, quoter: QUOTER_V2 }) })` quotes every decoded swap on a protocol with `maxSlippageBps` through Uniswap's QuoterV2 (`0x3d4e44eb1374240ce5f1b871ab261cd16335b76a` on Base), again only for requests that aren't already blocked. A minimum output more than `maxSlippageBps` below the quote is blocked, and the remediation states the smallest acceptable value. Approvals reuse the quote taken at evaluation; the swap's own minimum still protects execution.
+
 ## MCP gateway for multiple agents
 
 `agent-transaction-firewall/mcp` turns the firewall into the **only path to the wallet**: a gateway that holds wallet access, serves any number of agents over the [Model Context Protocol](https://modelcontextprotocol.io), and sends only what the firewall allows.
@@ -473,6 +494,7 @@ flowchart LR
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "adminTokenSha256": "<sha256 of the admin token>",
   "storage": { "dir": "/var/lib/agent-firewall", "fsync": true },
+  "quoter": { "uniswapV3QuoterV2": "0x3d4e44eb1374240ce5f1b871ab261cd16335b76a" }, // optional; for maxSlippageBps
   "agents": [
     { "id": "payments-bot", "tokenSha256": "<sha256>", "wallet": "0x…", "policy": { "version": 1, "chainIds": [8453], "…": "…" } }
   ]
@@ -501,6 +523,32 @@ One process sustains about 11,000–13,000 evaluations per second. With 64 agent
 
 On a Base mainnet fork, 20 agents sent 500 concurrent transfers through the MCP gateway (fsync on). The firewall accounted for a median of 0.7% of end-to-end time; wallet and chain time made up the rest. Budgets were enforced exactly (200 transfers executed, every agent stopped at its cap), onchain balances matched the executed count, and the 740-record audit chain verified.
 
+## Onchain enforcement with Zodiac Roles
+
+The firewall runs on a host you operate, so a compromised host or a leaked signer key bypasses it. For a Safe, `toZodiacRoles()` turns the same policy into permissions for the deployed, audited [Zodiac Roles Modifier v2](https://docs.roles.gnosisguild.org), which enforces them onchain as a second, independent layer:
+
+```ts
+import { execTransactionWithRole, toZodiacRoles } from 'agent-transaction-firewall';
+const plan = toZodiacRoles(policy, { roles: ROLES_MODIFIER, role: 'treasury-agent', members: [AGENT_SIGNER], allowancePeriodSeconds: 86_400 });
+for (const c of plan.calls) await ownerWallet.sendTransaction({ to: c.to, data: c.data }); // run by the Roles owner
+console.log(plan.warnings);                                                                 // what stays firewall-only
+// The agent then sends allowed calls through the modifier:
+await agentWallet.sendTransaction({ to: ROLES_MODIFIER, data: execTransactionWithRole({ to: USDC, data }, 'treasury-agent') });
+```
+
+| Policy | Onchain permission |
+|---|---|
+| Token `transfer` | Recipient in `recipients.allow` (any recipient if unset); amount ≤ `perTransactionMax`; total from a per-token allowance of `sessionMax` |
+| Token `approve` | Spender is a trusted spender or protocol; amount ≤ `maxApproval`; same per-token allowance |
+| Native transfers | Only to `recipients.allow`, from an allowance of `native.sessionMax` |
+| `kind: 'uniswap-v3-router'` | `exactInputSingle` / `exactOutputSingle` between listed tokens, recipient must be the Safe, non-zero minimum output when `swaps.missingSlippageProtection` is `'block'` |
+| Other protocols | Listed `selectors` (or the whole contract) with any arguments |
+| Anything else | Denied |
+
+Allowances are one-time budgets unless `allowancePeriodSeconds` refills them. `warnings` lists what has no onchain equivalent: review thresholds (amounts up to the per-transaction cap pass onchain), slippage against a quote, per-recipient windows, the denylist without an allowlist, session limits and NFT rules. Keep the firewall in front for those.
+
+`node scripts/zodiac-fork.mjs` checks the generated permissions against Roles v2.1.0 on a Base mainnet fork: it creates a Safe, attaches a Roles modifier, applies the plan and replays 18 agent transactions. Allowed transfers, approvals, a Uniswap swap and ETH sends execute; transfers above the cap or to unlisted recipients, unlimited approvals, approvals to untrusted spenders, swaps to another recipient or with no minimum output, overspent allowances, calls to other contracts and non-members all revert with the expected Roles error.
+
 ## API reference
 
 Everything is exported from the package root.
@@ -509,7 +557,7 @@ Everything is exported from the package root.
 
 | Member | Description |
 |---|---|
-| `createFirewall(options)` / `new Firewall(options)` | `options`: `policy` (input or compiled; invalid input throws `PolicyValidationError`), `audit?: AuditSink`, `sessions?: SessionStore`, `simulator?: Simulator`, `clock?: () => number`, `generateId?: () => string`. |
+| `createFirewall(options)` / `new Firewall(options)` | `options`: `policy` (input or compiled; invalid input throws `PolicyValidationError`), `audit?: AuditSink`, `sessions?: SessionStore`, `simulator?: Simulator`, `quoter?: Quoter`, `clock?: () => number`, `generateId?: () => string`. |
 | `evaluate(tx, { sessionId? })` | Returns a `Verdict`. **Never throws.** `tx` is `{ chainId, from, to?, value?, data? }` or `{ chainId, from, calls: [{ to?, value?, data? }] }` (1–256 calls). Unknown fields such as `gas` and `nonce` are ignored. |
 | `approve(verdict, { approver, note? })` | Approves a `requiresApproval` verdict and re-checks limits. Returns an `allowed` verdict with a reservation, or a `blocked` one. |
 | `reject(verdict, { approver, note? })` | Rejects a pending approval permanently. |
@@ -555,8 +603,11 @@ Returns a function with the same signature as `send`. Options: `firewall`, `chai
 | `GroupCommitFile` | Append-only line writer used by the durable stores. |
 | `agent-transaction-firewall/mcp` | `Gateway`, `createGatewayServer`, `serveStdio`, `handleMcpMessage`, `JsonRpcWallet`, `hashToken`. |
 | `createRpcSimulator({ url, timeoutMs?, fetch? })` | `eth_call` revert check (default timeout 1500 ms; batches reported as unavailable). |
+| `createUniswapV3Quoter({ url, quoter, timeoutMs?, fetch? })`, `uniswapV3QuoteCalldata(swap)` | QuoterV2 quotes for decoded swaps (default timeout 1500 ms). A `Quoter` is `(swap, signal) => Promise<{ status: 'ok', amount } \| { status: 'unavailable', reason }>`. |
+| `toZodiacRoles(policy, { roles, role, members?, allowancePeriodSeconds? })` | `{ roleKey, calls, allowances, warnings }` for the Roles owner. See [Zodiac Roles](#onchain-enforcement-with-zodiac-roles). |
+| `execTransactionWithRole(call, role, shouldRevert?)`, `encodeRoleKey(role)` | Agent-side calldata for the Roles modifier, and the bytes32 role key. |
 | `parseUnits`, `formatUnits`, `UINT256_MAX` | Amount helpers. |
-| `SELECTORS`, `PERMIT2_ADDRESS`, `UNLIMITED_APPROVAL_THRESHOLD` | Constants used by the decoder. |
+| `SELECTORS`, `UNISWAP_V3_ROUTER_SELECTORS`, `PERMIT2_ADDRESS`, `UNLIMITED_APPROVAL_THRESHOLD` | Constants used by the decoder. |
 
 ## Extending: custom stores and sinks
 
@@ -604,8 +655,9 @@ Set `pipelined: true` only if the sink persists overlapping `append` calls in ca
 - **No balance-diff simulation.** The engine judges declared intent from calldata; the optional `eth_call` check catches reverts, not hidden side effects. An allowlisted protocol can still move tokens within allowances already granted, which is why approvals are budgeted and spenders must be trusted.
 - **Unknown calls are unverified by definition.** Their default is `requiresApproval`; use `'block'` for unattended agents.
 - **USD-denominated limits are not built in.** Limits are per token in base units, which keeps decisions deterministic and oracle-free.
-- **Protocol calldata is checked by target and selector only.** For an allowlisted protocol such as a Uniswap router, the firewall doesn't decode the arguments, so it doesn't check the swap recipient or the minimum output (slippage). Restrict protocols to the selectors you need and keep their approvals small.
-- **Approval thresholds apply per transaction.** Splitting a payment into chunks below `requireApprovalAbove` isn't detected; only `sessionMax` bounds the total.
+- **Protocol calldata is decoded only for known kinds.** Uniswap SwapRouter02 (`kind: 'uniswap-v3-router'`) is decoded; for any other protocol the firewall checks only the target and selector, not the arguments (recipient, slippage). Restrict such protocols to the selectors you need and keep their approvals small.
+- **Slippage checks trust the quote RPC.** A quote is a read of current pool state; it does not detect a pool that is already manipulated, and it is skipped (with `swaps.quoteUnavailable`) when the RPC fails.
+- **Split payments are summed per recipient only.** `perRecipient` windows catch chunks to one address; spreading payments over many recipients is bounded only by `sessionMax` and `recipients.allow`.
 - **The defaults are in memory.** Use `JournalSessionStore` and a durable audit sink (or the gateway's `storage.dir`) in production.
 - This is a policy-enforcement layer, not a substitute for contract audits, key management or wallet-level controls.
 
@@ -613,7 +665,7 @@ Set `pipelined: true` only if the sink persists overlapping `append` calls in ca
 
 **Does it replace my wallet's own policy engine?** No. It's a pre-execution layer you control, with decoding and explanations that wallet policy engines usually lack. Keep wallet-level limits as a second, independent layer.
 
-**Does it need an RPC node?** No. Decisions use only the calldata, the policy and session state. An RPC URL is needed only if you enable the optional simulator.
+**Does it need an RPC node?** No. Decisions use only the calldata, the policy and session state. An RPC URL is needed only if you enable the optional simulator or swap quoter.
 
 **Why are amounts in base units instead of USD?** To stay deterministic and oracle-free. A price feed would make the same transaction pass or fail depending on market data and adds an oracle attack surface. Set per-token caps instead.
 
@@ -642,10 +694,11 @@ Set `pipelined: true` only if the sink persists overlapping `append` calls in ca
 
 | Command | Purpose |
 |---|---|
-| `npm test` | Vitest suite (ABI strictness, decoder, policy edge cases, concurrency, approvals, audit tampering, middleware, simulator) |
+| `npm test` | Vitest suite (ABI strictness, decoder, policy edge cases, concurrency, approvals, audit tampering, middleware, simulator, swap decoding and quotes, per-recipient windows, Zodiac Roles mapping) |
 | `npm run typecheck` | Strict TypeScript (`exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`) |
 | `npm run build` | Emit ESM + declarations to `dist/` |
 | `npm run bench` | Latency percentiles and concurrent throughput for in-memory, file and fsync stores (see [Latency](#latency)) |
+| `node scripts/zodiac-fork.mjs` | Applies `toZodiacRoles()` output to a real Safe and Roles modifier on a Base fork and checks 18 allowed and malicious agent transactions |
 | `node scripts/fork-lab.mjs` | Base mainnet fork (Foundry `anvil`) plus a gateway serving three agents, with `mcp.sh` and `admin.sh` clients for manual or agent-driven testing |
 
 ### Layout
@@ -663,7 +716,8 @@ src/gateway.ts     multi-agent gateway: auth, wallet backends, approval queue
 src/mcp.ts         MCP server (stdio + HTTP) and admin API
 src/cli.ts         transaction-firewall command
 src/audit.ts       hash-chained audit log and sinks
-src/simulation.ts  optional eth_call simulator
+src/simulation.ts  optional eth_call simulator and Uniswap V3 quoter
+src/zodiac.ts      policy → Zodiac Roles v2 permissions
 src/schemas.ts     Zod schemas for requests and policies
 ```
 

@@ -6,7 +6,7 @@
 // limits. Calls from the agent wallet to itself through `execute`/`executeBatch` are
 // unwrapped recursively so nested transfers cannot hide behind a wallet wrapper.
 
-import { AbiError, T, decodeAbi, hexToBytes, type AbiType, type AbiValue } from './abi.js';
+import { AbiError, T, bytesToHex, decodeAbi, hexToBytes, type AbiType, type AbiValue } from './abi.js';
 import type { CompiledPolicy } from './policy.js';
 import type { NormalizedRequest } from './schemas.js';
 
@@ -37,6 +37,40 @@ export const SELECTORS = {
   walletExecute: '0xb61d27f6',
   walletExecuteBatch: '0x34fcd5be',
 } as const;
+
+/** Uniswap SwapRouter02 functions decoded for protocols with `kind: 'uniswap-v3-router'`. */
+export const UNISWAP_V3_ROUTER_SELECTORS = {
+  exactInputSingle: '0x04e45aaf',
+  exactInput: '0xb858183f',
+  exactOutputSingle: '0x5023b4df',
+  exactOutput: '0x09b81346',
+  multicall: '0xac9650d8',
+  multicallWithDeadline: '0x5ae401dc',
+  multicallWithBlockhash: '0x1f0464d1',
+  unwrapWETH9: '0x49404b7c',
+  unwrapWETH9ToSender: '0x49616997',
+  sweepToken: '0xdf2ab5bb',
+  sweepTokenToSender: '0xe90a182f',
+  refundETH: '0x12210e8a',
+} as const;
+
+const ROUTER_SELECTOR_SET: ReadonlySet<string> = new Set(Object.values(UNISWAP_V3_ROUTER_SELECTORS));
+
+/** True if `selector` is a SwapRouter02 function the decoder understands. */
+export function isDecodedRouterSelector(selector: string | null): boolean {
+  return selector !== null && ROUTER_SELECTOR_SET.has(selector);
+}
+
+/** SwapRouter02 recipient placeholders: msg.sender and the router itself. */
+const ROUTER_MSG_SENDER = '0x0000000000000000000000000000000000000001';
+const ROUTER_ADDRESS_THIS = '0x0000000000000000000000000000000000000002';
+
+/** One pool hop, in swap direction. */
+export interface SwapPool {
+  readonly tokenIn: string;
+  readonly tokenOut: string;
+  readonly fee: number;
+}
 
 export type Action =
   | { type: 'native_transfer'; path: string; to: string; amount: bigint }
@@ -76,6 +110,21 @@ export type Action =
     }
   | { type: 'nft_approval'; path: string; collection: string; spender: string; tokenId: bigint }
   | { type: 'operator_approval'; path: string; collection: string; operator: string; approved: boolean }
+  | {
+      type: 'swap';
+      path: string;
+      router: string;
+      /** `input`: amountIn is exact, amountOut is the minimum. `output`: amountOut is exact, amountIn is the maximum. */
+      exact: 'input' | 'output';
+      tokenIn: string;
+      tokenOut: string;
+      pools: SwapPool[];
+      /** Placeholders resolved: msg.sender is the agent wallet, ADDRESS_THIS is the router. */
+      recipient: string;
+      amountIn: bigint;
+      amountOut: bigint;
+    }
+  | { type: 'router_withdrawal'; path: string; router: string; /** null: WETH unwrapped to ETH */ token: string | null; recipient: string; minimum: bigint }
   | { type: 'contract_call'; path: string; target: string; selector: string | null; value: bigint }
   | { type: 'contract_deployment'; path: string; value: bigint; initCodeBytes: number }
   | { type: 'wallet_self_call'; path: string; selector: string | null };
@@ -231,6 +280,115 @@ const METHODS: Readonly<Record<string, Method>> = {
   },
 };
 
+export type SwapAction = Extract<Action, { type: 'swap' }>;
+
+const SWAP_SINGLE = T.tuple(T.address, T.address, T.uint24, T.address, T.uint256, T.uint256, T.uint160);
+const SWAP_MULTI = T.tuple(T.bytes, T.address, T.uint256, T.uint256);
+
+/** Parse a packed V3 path (token, fee, token, …). Exact-output paths are encoded tokenOut-first. */
+function decodeRoute(hex: string, reversed: boolean): SwapPool[] | null {
+  const b = hexToBytes(hex);
+  if (b.length < 43 || (b.length - 20) % 23 !== 0) return null;
+  const tokens: string[] = [];
+  const fees: number[] = [];
+  for (let o = 0; ; o += 23) {
+    tokens.push(bytesToHex(b.subarray(o, o + 20)));
+    if (o + 20 === b.length) break;
+    fees.push((b[o + 20]! << 16) | (b[o + 21]! << 8) | b[o + 22]!);
+  }
+  if (reversed) {
+    tokens.reverse();
+    fees.reverse();
+  }
+  return fees.map((fee, i) => ({ tokenIn: tokens[i]!, tokenOut: tokens[i + 1]!, fee }));
+}
+
+/** Decode one SwapRouter02 call. Returns false for functions it doesn't understand. */
+function routerCall(router: string, data: Uint8Array, selector: string, path: string, ctx: Ctx, nested: boolean): boolean {
+  const R = UNISWAP_V3_ROUTER_SELECTORS;
+  const resolve = (r: string) => (r === ROUTER_MSG_SENDER ? ctx.wallet : r === ROUTER_ADDRESS_THIS ? router : r);
+  const swap = (exact: 'input' | 'output', pools: SwapPool[], recipient: string, amountIn: bigint, amountOut: bigint) => {
+    ctx.out.actions.push({
+      type: 'swap', path, router, exact, tokenIn: pools[0]!.tokenIn, tokenOut: pools[pools.length - 1]!.tokenOut,
+      pools, recipient: resolve(recipient), amountIn, amountOut,
+    });
+  };
+  const withdraw = (token: string | null, recipient: string, minimum: bigint) => {
+    ctx.out.actions.push({ type: 'router_withdrawal', path, router, token, recipient: resolve(recipient), minimum });
+  };
+  switch (selector) {
+    case R.exactInputSingle:
+    case R.exactOutputSingle: {
+      const args = decodeArgs([SWAP_SINGLE], data, path, ctx);
+      if (!args) return true;
+      const [tokenIn, tokenOut, fee, recipient, a, b] = args[0] as AbiValue[];
+      const pools = [{ tokenIn: str(tokenIn), tokenOut: str(tokenOut), fee: Number(big(fee)) }];
+      if (selector === R.exactInputSingle) swap('input', pools, str(recipient), big(a), big(b));
+      else swap('output', pools, str(recipient), big(b), big(a));
+      return true;
+    }
+    case R.exactInput:
+    case R.exactOutput: {
+      const args = decodeArgs([SWAP_MULTI], data, path, ctx);
+      if (!args) return true;
+      const [route, recipient, a, b] = args[0] as AbiValue[];
+      const pools = decodeRoute(str(route), selector === R.exactOutput);
+      if (!pools) {
+        ctx.out.issues.push({ path, code: 'CALLDATA_MALFORMED', message: 'Swap path is not a valid Uniswap V3 path' });
+        return true;
+      }
+      if (selector === R.exactInput) swap('input', pools, str(recipient), big(a), big(b));
+      else swap('output', pools, str(recipient), big(b), big(a));
+      return true;
+    }
+    case R.unwrapWETH9: {
+      const args = decodeArgs([T.uint256, T.address], data, path, ctx);
+      if (args) withdraw(null, str(args[1]), big(args[0]));
+      return true;
+    }
+    case R.unwrapWETH9ToSender: {
+      const args = decodeArgs([T.uint256], data, path, ctx);
+      if (args) withdraw(null, ctx.wallet, big(args[0]));
+      return true;
+    }
+    case R.sweepToken: {
+      const args = decodeArgs([T.address, T.uint256, T.address], data, path, ctx);
+      if (args) withdraw(str(args[0]), str(args[2]), big(args[1]));
+      return true;
+    }
+    case R.sweepTokenToSender: {
+      const args = decodeArgs([T.address, T.uint256], data, path, ctx);
+      if (args) withdraw(str(args[0]), ctx.wallet, big(args[1]));
+      return true;
+    }
+    case R.refundETH:
+      decodeArgs([], data, path, ctx);
+      return true;
+    case R.multicall:
+    case R.multicallWithDeadline:
+    case R.multicallWithBlockhash: {
+      if (nested) {
+        ctx.out.issues.push({ path, code: 'NESTING_TOO_DEEP', message: 'Nested router multicall is not supported' });
+        return true;
+      }
+      const types = selector === R.multicall ? [T.array(T.bytes)] : [selector === R.multicallWithDeadline ? T.uint256 : T.bytes32, T.array(T.bytes)];
+      const args = decodeArgs(types, data, path, ctx);
+      if (!args) return true;
+      (args[args.length - 1] as string[]).forEach((innerHex, i) => {
+        const inner = hexToBytes(innerHex);
+        const innerPath = `${path}/${i}`;
+        const innerSelector = inner.length >= 4 ? innerHex.slice(0, 10) : null;
+        if (!innerSelector || !routerCall(router, inner, innerSelector, innerPath, ctx, true)) {
+          ctx.out.actions.push({ type: 'contract_call', path: innerPath, target: router, selector: innerSelector, value: 0n });
+        }
+      });
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 const EXECUTE_TYPES = [T.address, T.uint256, T.bytes] as const;
 const EXECUTE_BATCH_TYPES = [T.array(T.tuple(T.address, T.uint256, T.bytes))] as const;
 
@@ -296,6 +454,12 @@ function visit(to: string | null, value: bigint, dataHex: string, path: string, 
 
   if (data.length === 0 && value > 0n) {
     ctx.out.actions.push({ type: 'native_transfer', path, to, amount: value });
+    return;
+  }
+
+  if (ctx.policy.protocols.get(to)?.kind === 'uniswap-v3-router') {
+    ctx.out.actions.push({ type: 'contract_call', path, target: to, selector, value });
+    if (selector) routerCall(to, data, selector, path, ctx, false);
     return;
   }
 

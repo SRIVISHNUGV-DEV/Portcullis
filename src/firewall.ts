@@ -12,14 +12,15 @@ import {
   summarize,
   type EngineResult,
   type Finding,
+  type QuoteOutcome,
   type RiskLevel,
   type SimulationOutcome,
   type VerdictStatus,
 } from './engine.js';
 import { compilePolicy, type CompiledPolicy } from './policy.js';
 import { TransactionRequestSchema, type NormalizedRequest, type PolicyInput } from './schemas.js';
-import { MemorySessionStore, addSpend, totalSpent, type SessionState, type SessionStore } from './session.js';
-import type { Simulator } from './simulation.js';
+import { MemorySessionStore, addSpend, recentFlows, totalSpent, type SessionState, type SessionStore } from './session.js';
+import type { Quoter, Simulator } from './simulation.js';
 
 export interface FirewallOptions {
   /** Policy definition (validated at construction; invalid policies throw) or a compiled policy. */
@@ -32,6 +33,8 @@ export interface FirewallOptions {
   /** Session usage store. Defaults to in-process memory (single instance only). */
   readonly sessions?: SessionStore;
   readonly simulator?: Simulator;
+  /** Live swap quotes, used for protocols with `maxSlippageBps`. */
+  readonly quoter?: Quoter;
   /** Epoch milliseconds. Injectable for deterministic tests. */
   readonly clock?: () => number;
   readonly generateId?: () => string;
@@ -96,6 +99,9 @@ export class Firewall {
   private readonly audit: AuditLog;
   private readonly sessions: SessionStore;
   private readonly simulator: Simulator | undefined;
+  private readonly quoter: Quoter | undefined;
+  /** Longest per-recipient window; committed transfers older than this are dropped. */
+  private readonly maxWindowMs: number;
   private readonly clock: () => number;
   private readonly generateId: () => string;
 
@@ -105,6 +111,9 @@ export class Firewall {
     this.audit = options.audit instanceof AuditLog ? options.audit : new AuditLog(options.audit ?? new MemoryAuditSink(), this.clock);
     this.sessions = options.sessions ?? new MemorySessionStore();
     this.simulator = options.simulator;
+    this.quoter = options.quoter;
+    const windows = [this.policy.policy.native, ...this.policy.policy.tokens].map((r) => r.perRecipient?.windowSeconds ?? 0);
+    this.maxWindowMs = Math.max(0, ...windows) * 1000;
     this.generateId = options.generateId ?? randomUUID;
   }
 
@@ -132,30 +141,36 @@ export class Firewall {
 
     try {
       let simulation: SimulationOutcome | undefined;
-      if (this.simulator) {
-        // Read-only pre-check: skip simulation for requests that are blocked regardless.
-        const pre = await this.sessions.transact(sessionId, now, (state) => this.run(request, state, now));
+      let quotes: (QuoteOutcome | null)[] | undefined;
+      if (this.simulator || this.quoter) {
+        // Read-only pre-check: skip simulation and quotes for requests that are blocked regardless.
+        const pre = await this.sessions.transact(sessionId, now, (state) => this.run(request, state, now, undefined, undefined, true));
         if (pre.verdict === 'blocked') {
           return await this.finalizeUnreserved(requestId, sessionId, request, txDigest, pre, started, now);
         }
-        simulation = await this.simulate(request);
+        [simulation, quotes] = await Promise.all([
+          this.simulator ? this.simulate(request) : undefined,
+          this.quoter ? this.quote(pre) : undefined,
+        ]);
       }
       const outcome = await this.sessions.transact(sessionId, now, async (state) => {
-        const result = this.run(request, state, now, simulation);
+        const result = this.run(request, state, now, simulation, quotes);
         let reservationId: string | undefined;
         let approvalExpiresAt: number | undefined;
         if (result.verdict === 'allowed') {
           reservationId = this.generateId();
-          state.pending[reservationId] = { spend: result.spend, createdAt: now, requestId };
+          state.pending[reservationId] = { spend: result.spend, createdAt: now, requestId, ...(result.flows.length ? { flows: result.flows } : {}) };
           state.txCount += 1;
         } else if (result.verdict === 'requiresApproval') {
           approvalExpiresAt = now + this.policy.policy.approvalTtlSeconds * 1000;
-          state.approvals[requestId] = { request, txDigest, expiresAt: approvalExpiresAt, ...(simulation ? { simulation } : {}) };
+          state.approvals[requestId] = {
+            request, txDigest, expiresAt: approvalExpiresAt, ...(simulation ? { simulation } : {}), ...(quotes ? { quotes } : {}),
+          };
         }
         for (const [id, a] of Object.entries(state.approvals)) if (a.expiresAt < now) delete state.approvals[id];
         const durationMs = performance.now() - started;
         const audit = await this.prepareRecord('evaluation', requestId, sessionId, {
-          txDigest, request, result: auditSummary(result), reservationId, simulation, durationMs,
+          txDigest, request, result: auditSummary(result), reservationId, simulation, quotes, durationMs,
         });
         const verdict = this.verdict({
           requestId, sessionId, request, txDigest, result, now, durationMs, auditHash: audit.hash,
@@ -209,11 +224,12 @@ export class Firewall {
       if (stored.expiresAt < now) throw new FirewallStateError('Approval window expired; evaluate the transaction again');
       if (stored.txDigest !== pending.txDigest) throw new FirewallStateError('Verdict does not match the evaluated transaction');
 
-      const result = this.run(stored.request, state, now, stored.simulation);
+      const result = this.run(stored.request, state, now, stored.simulation, stored.quotes);
       let reservationId: string | undefined;
       if (result.verdict !== 'blocked') {
         reservationId = this.generateId();
-        state.pending[reservationId] = { spend: result.spend, createdAt: now, requestId: pending.requestId };
+        const flows = result.flows.map((fl) => ({ ...fl, approved: true }));
+        state.pending[reservationId] = { spend: result.spend, createdAt: now, requestId: pending.requestId, ...(flows.length ? { flows } : {}) };
         state.txCount += 1;
       }
       const approvedAt = new Date(now).toISOString();
@@ -259,6 +275,10 @@ export class Firewall {
       const audit = await this.prepareRecord('commit', allowed.requestId, allowed.sessionId, { reservationId, txHash: receipt.txHash });
       delete state.pending[reservationId];
       state.committed = addSpend(state.committed, r.spend);
+      if (r.flows || state.recentFlows?.length) {
+        const since = this.clock() - this.maxWindowMs;
+        state.recentFlows = [...(state.recentFlows ?? []), ...(r.flows ?? [])].filter((fl) => fl.at > since);
+      }
       return { persisted: audit.persisted };
     });
     await persisted;
@@ -285,12 +305,38 @@ export class Firewall {
     }));
   }
 
-  private run(request: NormalizedRequest, state: SessionState, now: number, simulation?: SimulationOutcome): EngineResult {
+  private run(
+    request: NormalizedRequest, state: SessionState, now: number,
+    simulation?: SimulationOutcome, quotes?: readonly (QuoteOutcome | null)[], deferQuotes = false,
+  ): EngineResult {
     return evaluatePolicy({
       request, policy: this.policy, now,
-      session: { createdAt: state.createdAt, txCount: state.txCount, spent: totalSpent(state) },
+      session: {
+        createdAt: state.createdAt, txCount: state.txCount, spent: totalSpent(state),
+        ...(this.maxWindowMs ? { recentFlows: recentFlows(state) } : {}),
+      },
       ...(simulation ? { simulation } : {}),
+      ...(quotes ? { quotes } : {}),
+      ...(deferQuotes ? { deferQuotes } : {}),
     });
+  }
+
+  /** Quote every decoded swap on a protocol with `maxSlippageBps`, in parallel. */
+  private async quote(pre: EngineResult): Promise<(QuoteOutcome | null)[] | undefined> {
+    const swaps = pre.decoded.actions.filter((a) => a.type === 'swap');
+    if (!swaps.some((s) => this.policy.protocols.get(s.router)?.maxSlippageBps !== undefined)) return undefined;
+    return Promise.all(
+      swaps.map(async (s): Promise<QuoteOutcome | null> => {
+        if (this.policy.protocols.get(s.router)?.maxSlippageBps === undefined) return null;
+        const controller = new AbortController();
+        try {
+          return await this.quoter!(s, controller.signal);
+        } catch (e) {
+          controller.abort();
+          return { status: 'unavailable', reason: e instanceof Error ? e.message.slice(0, 200) : 'quoter failed' };
+        }
+      }),
+    );
   }
 
   private async simulate(request: NormalizedRequest): Promise<SimulationOutcome> {
