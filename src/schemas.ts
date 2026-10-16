@@ -86,6 +86,18 @@ export type NormalizedCall = NormalizedRequest['calls'][number];
 
 // ── policy ──────────────────────────────────────────────────────────────────
 
+/** Rolling-window limit on the total sent to any one recipient, so split payments are caught. */
+export const RecipientWindowSchema = z.strictObject({
+  windowSeconds: z.number().int().min(1).max(31_536_000),
+  /**
+   * Total to one recipient within the window above which a human approval is needed.
+   * Defaults to the rule's `requireApprovalAbove`. Amounts a human approved don't count.
+   */
+  requireApprovalAbove: AmountSchema.optional(),
+  /** Hard cap on the total to one recipient within the window, approved amounts included. */
+  max: AmountSchema.optional(),
+});
+
 export const TokenRuleSchema = z.strictObject({
   address: AddressSchema,
   symbol: z.string().min(1).max(32),
@@ -100,6 +112,7 @@ export const TokenRuleSchema = z.strictObject({
   maxApproval: AmountSchema.optional(),
   /** Extra non-transfer functions allowed on this token, e.g. WETH `deposit()`/`withdraw(uint256)`. */
   allowedFunctions: z.array(SelectorSchema).default([]),
+  perRecipient: RecipientWindowSchema.optional(),
 });
 
 export const NftRuleSchema = z.strictObject({
@@ -117,6 +130,13 @@ export const ProtocolRuleSchema = z.strictObject({
   selectors: z.array(SelectorSchema).min(1).optional(),
   /** Maximum native value per call to this contract. */
   maxNativeValue: AmountSchema.optional(),
+  /**
+   * Decode this contract's calldata. `uniswap-v3-router`: Uniswap SwapRouter02 swaps,
+   * multicall, unwrapWETH9 and sweepToken; the swap output must go to the agent wallet.
+   */
+  kind: z.enum(['uniswap-v3-router']).optional(),
+  /** Largest accepted gap between a swap's minimum output and a live quote. Needs a quoter. */
+  maxSlippageBps: z.number().int().min(0).max(5000).optional(),
 });
 
 export const PolicySchema = z
@@ -129,6 +149,7 @@ export const PolicySchema = z
       perTransactionMax: AmountSchema,
       sessionMax: AmountSchema,
       requireApprovalAbove: AmountSchema.optional(),
+      perRecipient: RecipientWindowSchema.optional(),
     }),
     tokens: z.array(TokenRuleSchema).default([]),
     nfts: z.array(NftRuleSchema).default([]),
@@ -155,6 +176,14 @@ export const PolicySchema = z
     /** Calls to contracts that are not allowlisted protocols, or unrecognised functions. */
     unknownContractCalls: ModeSchema.default('requireApproval'),
     contractDeployment: ModeSchema.default('block'),
+    swaps: z
+      .strictObject({
+        /** A swap with no minimum output (or no maximum input) can be sandwiched for its full value. */
+        missingSlippageProtection: ModeSchema.default('block'),
+        /** Applied when `maxSlippageBps` is set but no quote can be obtained. */
+        quoteUnavailable: ModeSchema.default('requireApproval'),
+      })
+      .prefault({}),
     session: z
       .strictObject({
         maxDurationSeconds: z.number().int().positive().optional(),
@@ -203,6 +232,22 @@ export const PolicySchema = z
     for (const a of trusted) {
       if (deny.has(a)) ctx.addIssue({ code: 'custom', message: `${a} is both denylisted and allowlisted` });
     }
+
+    const windowRules: [string, { requireApprovalAbove?: bigint | undefined; perRecipient?: z.output<typeof RecipientWindowSchema> | undefined }][] = [
+      ['native', p.native],
+      ...p.tokens.map((t) => [`token ${t.symbol}`, t] as [string, typeof t]),
+    ];
+    for (const [name, rule] of windowRules) {
+      const w = rule.perRecipient;
+      if (w && w.requireApprovalAbove === undefined && rule.requireApprovalAbove === undefined && w.max === undefined) {
+        ctx.addIssue({ code: 'custom', message: `${name}: perRecipient needs requireApprovalAbove or max` });
+      }
+    }
+    for (const pr of p.protocols) {
+      if (pr.maxSlippageBps !== undefined && !pr.kind) {
+        ctx.addIssue({ code: 'custom', message: `protocol ${pr.name}: maxSlippageBps needs a decodable kind` });
+      }
+    }
   });
 
 export type PolicyInput = z.input<typeof PolicySchema>;
@@ -210,3 +255,4 @@ export type Policy = z.output<typeof PolicySchema>;
 export type TokenRule = z.output<typeof TokenRuleSchema>;
 export type NftRule = z.output<typeof NftRuleSchema>;
 export type ProtocolRule = z.output<typeof ProtocolRuleSchema>;
+export type RecipientWindow = z.output<typeof RecipientWindowSchema>;

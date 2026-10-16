@@ -1,4 +1,6 @@
-import type { SimulationOutcome } from './engine.js';
+import { T, bytesToHex, encodeAbi, hexToBytes } from './abi.js';
+import type { SwapAction, SwapPool } from './decoder.js';
+import type { QuoteOutcome, SimulationOutcome } from './engine.js';
 import type { NormalizedRequest } from './schemas.js';
 
 /**
@@ -61,5 +63,78 @@ export function createRpcSimulator(options: RpcSimulatorOptions): Simulator {
     }
     if (typeof body.result !== 'string') return { status: 'unavailable', reason: 'RPC returned no result' };
     return { status: 'ok' };
+  };
+}
+
+/**
+ * Live quote for a decoded swap. Return `unavailable` (or throw) when no quote can be
+ * obtained; the firewall then applies `policy.swaps.quoteUnavailable`.
+ */
+export type Quoter = (swap: SwapAction, signal: AbortSignal) => Promise<QuoteOutcome>;
+
+export interface UniswapV3QuoterOptions {
+  /** JSON-RPC endpoint for the swap's chain. Treat URLs containing API keys as secrets. */
+  readonly url: string;
+  /** QuoterV2 contract, e.g. 0x3d4e44eb1374240ce5f1b871ab261cd16335b76a on Base. */
+  readonly quoter: string;
+  readonly timeoutMs?: number;
+  readonly fetch?: typeof fetch;
+}
+
+const QUOTE_SINGLE = T.tuple(T.address, T.address, T.uint256, T.uint24, T.uint160);
+
+function packPath(pools: readonly SwapPool[], reversed: boolean): string {
+  const tokens = [pools[0]!.tokenIn, ...pools.map((x) => x.tokenOut)];
+  const fees = pools.map((x) => x.fee);
+  if (reversed) {
+    tokens.reverse();
+    fees.reverse();
+  }
+  let hex = tokens[0]!.slice(2);
+  fees.forEach((fee, i) => {
+    hex += fee.toString(16).padStart(6, '0') + tokens[i + 1]!.slice(2);
+  });
+  return `0x${hex}`;
+}
+
+/** Calldata for the QuoterV2 call matching a swap. */
+export function uniswapV3QuoteCalldata(swap: SwapAction): string {
+  const single = swap.pools.length === 1;
+  const pool = swap.pools[0]!;
+  const encode = (selector: string, data: Uint8Array) => selector + bytesToHex(data).slice(2);
+  if (swap.exact === 'input') {
+    return single
+      ? encode('0xc6a5026a', encodeAbi([QUOTE_SINGLE], [[pool.tokenIn, pool.tokenOut, swap.amountIn, BigInt(pool.fee), 0n]]))
+      : encode('0xcdca1753', encodeAbi([T.bytes, T.uint256], [packPath(swap.pools, false), swap.amountIn]));
+  }
+  return single
+    ? encode('0xbd21704a', encodeAbi([QUOTE_SINGLE], [[pool.tokenIn, pool.tokenOut, swap.amountOut, BigInt(pool.fee), 0n]]))
+    : encode('0x2f80bb1d', encodeAbi([T.bytes, T.uint256], [packPath(swap.pools, true), swap.amountOut]));
+}
+
+/** Quotes Uniswap V3 swaps with QuoterV2 over `eth_call`. */
+export function createUniswapV3Quoter(options: UniswapV3QuoterOptions): Quoter {
+  const doFetch = options.fetch ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 1500;
+  const quoter = options.quoter.toLowerCase();
+  return async (swap, signal) => {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    let body: { result?: unknown; error?: { message?: string } };
+    try {
+      const response = await doFetch(options.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: quoter, data: uniswapV3QuoteCalldata(swap) }, 'latest'] }),
+        signal: AbortSignal.any([signal, timeout]),
+      });
+      if (!response.ok) return { status: 'unavailable', reason: `quote RPC returned HTTP ${response.status}` };
+      body = (await response.json()) as typeof body;
+    } catch {
+      return { status: 'unavailable', reason: timeout.aborted ? `quote RPC timed out after ${timeoutMs} ms` : 'quote RPC request failed' };
+    }
+    if (body.error) return { status: 'unavailable', reason: `quote failed: ${String(body.error.message ?? 'unknown error').slice(0, 200)}` };
+    if (typeof body.result !== 'string' || !/^0x[0-9a-fA-F]{64,}$/.test(body.result)) return { status: 'unavailable', reason: 'quoter returned no amount' };
+    const first = hexToBytes(body.result).subarray(0, 32);
+    return { status: 'ok', amount: BigInt(bytesToHex(first)) };
   };
 }

@@ -17,6 +17,7 @@ import { Firewall, FirewallStateError, type Verdict } from './firewall.js';
 import { compilePolicy } from './policy.js';
 import { AddressSchema, ChainIdSchema, type TokenRule } from './schemas.js';
 import { MemorySessionStore, type SessionStore } from './session.js';
+import { createUniswapV3Quoter, type Quoter } from './simulation.js';
 import { JournalSessionStore } from './storage.js';
 import { UINT256_MAX, formatUnits, parseUnits } from './units.js';
 
@@ -131,6 +132,8 @@ export const GatewayConfigSchema = z
     adminTokenSha256: Sha256HexSchema.optional(),
     /** Durable journal + audit log directory. Without it everything is in memory. */
     storage: z.object({ dir: z.string().min(1), fsync: z.boolean().default(true) }).strict().optional(),
+    /** Uniswap QuoterV2 for protocols with `maxSlippageBps`. `rpcUrl` defaults to the gateway's. */
+    quoter: z.object({ uniswapV3QuoterV2: AddressSchema, rpcUrl: z.string().url().optional() }).strict().optional(),
     agents: z.array(AgentConfigSchema).min(1),
   })
   .strict()
@@ -238,6 +241,8 @@ export interface GatewayDeps {
   readonly generateId?: () => string;
   /** Wait for a receipt after sending, up to this many milliseconds. Default 0 (don't wait). */
   readonly receiptTimeoutMs?: number;
+  /** Overrides the quoter built from `config.quoter`. */
+  readonly quoter?: Quoter;
 }
 
 export class Gateway {
@@ -254,11 +259,14 @@ export class Gateway {
     private readonly deps: GatewayDeps,
   ) {
     this.config = config;
+    const quoteUrl = config.quoter?.rpcUrl ?? config.rpcUrl;
+    const quoter = deps.quoter ?? (config.quoter && quoteUrl ? createUniswapV3Quoter({ url: quoteUrl, quoter: config.quoter.uniswapV3QuoterV2 }) : undefined);
     for (const a of config.agents) {
       const policy = compilePolicy(a.policy);
       if (!policy.chainIds.has(config.chainId)) throw new GatewayError(`Agent ${a.id}: policy does not allow chain ${config.chainId}`);
       const firewall = new Firewall({
         policy, audit: audit.log, sessions,
+        ...(quoter && policy.policy.protocols.some((pr) => pr.maxSlippageBps !== undefined) ? { quoter } : {}),
         ...(deps.clock ? { clock: deps.clock } : {}),
         ...(deps.generateId ? { generateId: deps.generateId } : {}),
       });
@@ -330,6 +338,9 @@ export class Gateway {
 
     if (options.dryRun) {
       if (verdict.allowed) await agent.firewall.release(verdict, 'dry run');
+      else if (verdict.verdict === 'requiresApproval') {
+        await agent.firewall.reject(verdict, { approver: 'gateway', note: 'dry run' });
+      }
       return base('checked');
     }
     if (verdict.verdict === 'blocked') return this.track(agent.id, verdict, call, base('blocked'));

@@ -5,8 +5,8 @@
 // and verdicts. Policy outcomes decide the verdict; the risk score only ranks
 // severity for reviewers and never relaxes a policy outcome.
 
-import { decodeRequest, type Action, type DecodeResult } from './decoder.js';
-import { describeAction, formatNative, formatTokenAmount, joinSentences, label } from './explain.js';
+import { UNLIMITED_APPROVAL_THRESHOLD, decodeRequest, isDecodedRouterSelector, type Action, type DecodeResult, type SwapAction } from './decoder.js';
+import { describeAction, formatDuration, formatNative, formatTokenAmount, joinSentences, label } from './explain.js';
 import type { CompiledPolicy } from './policy.js';
 import type { Mode, NormalizedRequest } from './schemas.js';
 
@@ -32,16 +32,35 @@ export interface Spend {
   tokens: Record<string, bigint>;
 }
 
+/** An outgoing transfer to one recipient, tracked for rolling per-recipient windows. */
+export interface Flow {
+  /** "native" or a listed token address. */
+  readonly asset: string;
+  readonly to: string;
+  readonly amount: bigint;
+  /** Epoch milliseconds when the spend was reserved. */
+  readonly at: number;
+  /** Reserved through a human approval; excluded from window review thresholds. */
+  readonly approved?: boolean;
+}
+
 export interface SessionView {
   readonly createdAt: number;
   readonly txCount: number;
   /** Committed plus pending (reserved) spend. */
   readonly spent: Spend;
+  /** Recent committed and pending transfers, for per-recipient windows. */
+  readonly recentFlows?: readonly Flow[];
 }
 
 export type SimulationOutcome =
   | { readonly status: 'ok' }
   | { readonly status: 'reverted'; readonly reason: string }
+  | { readonly status: 'unavailable'; readonly reason: string };
+
+/** Live quote for a swap: expected output (exact input) or required input (exact output). */
+export type QuoteOutcome =
+  | { readonly status: 'ok'; readonly amount: bigint }
   | { readonly status: 'unavailable'; readonly reason: string };
 
 export interface EngineInput {
@@ -51,6 +70,10 @@ export interface EngineInput {
   /** Unix epoch milliseconds. */
   readonly now: number;
   readonly simulation?: SimulationOutcome;
+  /** Quotes aligned with the decoded swap actions, in order; null where none was requested. */
+  readonly quotes?: readonly (QuoteOutcome | null)[];
+  /** Pre-check before quotes are fetched: skip quote-dependent findings. */
+  readonly deferQuotes?: boolean;
 }
 
 export interface EngineResult {
@@ -59,6 +82,8 @@ export interface EngineResult {
   readonly decoded: DecodeResult;
   /** Spend this request adds to the session if it executes. */
   readonly spend: Spend;
+  /** Transfers this request adds to per-recipient windows if it executes. */
+  readonly flows: Flow[];
   readonly riskScore: number;
   readonly riskLevel: RiskLevel;
   readonly summary: string;
@@ -105,6 +130,10 @@ function addressesOf(action: Action): string[] {
       return [action.collection, action.spender];
     case 'operator_approval':
       return [action.collection, action.operator];
+    case 'swap':
+      return [action.router, action.recipient, ...action.pools.flatMap((x) => [x.tokenIn, x.tokenOut])];
+    case 'router_withdrawal':
+      return action.token ? [action.router, action.token, action.recipient] : [action.router, action.recipient];
     case 'contract_call':
       return [action.target];
     case 'contract_deployment':
@@ -138,6 +167,67 @@ function unlisted(p: CompiledPolicy, f: Findings, path: string, contract: string
     message: `${what} involves ${contract}, which is not a configured token or collection`,
     remediation: 'Add the contract to policy.tokens/nfts with explicit limits after verifying it',
   });
+}
+
+function checkSwap(
+  a: SwapAction, all: readonly Action[], wallet: string, p: CompiledPolicy, f: Findings, quote: QuoteOutcome | null | undefined, deferQuotes: boolean,
+): void {
+  const { path } = a;
+  const fmt = (token: string, v: bigint) => formatTokenAmount(p, token, v);
+  if (a.recipient === a.router) {
+    // Output parked in the router is fine only if the same multicall withdraws it to the wallet.
+    const call = path.split('/')[0];
+    const withdrawn = all.some((w) => w.type === 'router_withdrawal' && w.path.split('/')[0] === call && w.recipient === wallet && (w.token === null || w.token === a.tokenOut));
+    if (!withdrawn) {
+      f.add({
+        code: 'SWAP_RECIPIENT_NOT_WALLET', outcome: 'block', severity: 'critical', path,
+        message: `Swap output stays in the router and is not withdrawn to the agent wallet in the same multicall`,
+        remediation: 'Set the swap recipient to the agent wallet',
+      });
+    }
+  } else if (a.recipient !== wallet) {
+    f.add({
+      code: 'SWAP_RECIPIENT_NOT_WALLET', outcome: 'block', severity: 'critical', path,
+      message: `Swap output would go to ${a.recipient}, not the agent wallet`,
+      remediation: 'Set the swap recipient to the agent wallet',
+    });
+  }
+  for (const token of new Set([a.tokenIn, a.tokenOut])) if (!p.tokens.has(token)) unlisted(p, f, path, token, 'Swap');
+
+  const unprotected = a.exact === 'input' ? a.amountOut === 0n : a.amountIn >= UNLIMITED_APPROVAL_THRESHOLD;
+  if (unprotected) {
+    f.mode(p.policy.swaps.missingSlippageProtection, {
+      code: 'SWAP_NO_SLIPPAGE_PROTECTION', severity: 'high', path,
+      message: a.exact === 'input'
+        ? `Swap accepts any output (amountOutMinimum is 0), so it can be sandwiched for up to its full ${fmt(a.tokenIn, a.amountIn)}`
+        : 'Swap accepts any input amount (amountInMaximum is unbounded), so it can be sandwiched',
+      remediation: a.exact === 'input' ? 'Set amountOutMinimum from a fresh quote minus your slippage tolerance' : 'Set amountInMaximum from a fresh quote plus your slippage tolerance',
+    });
+  }
+
+  const bps = p.protocols.get(a.router)?.maxSlippageBps;
+  if (bps === undefined || unprotected || deferQuotes) return;
+  if (!quote || quote.status !== 'ok') {
+    f.mode(p.policy.swaps.quoteUnavailable, {
+      code: 'SWAP_QUOTE_UNAVAILABLE', severity: 'medium', path,
+      message: `Slippage could not be checked: ${quote?.reason ?? 'no quoter is configured'}`,
+    });
+    return;
+  }
+  const pct = (n: bigint, d: bigint) => (d === 0n ? '100' : (Number((n * 10_000n) / d) / 100).toFixed(2));
+  if (a.exact === 'input' && a.amountOut * 10_000n < quote.amount * BigInt(10_000 - bps)) {
+    f.add({
+      code: 'SWAP_SLIPPAGE_TOO_HIGH', outcome: 'block', severity: 'high', path,
+      message: `Swap accepts as little as ${fmt(a.tokenOut, a.amountOut)}, ${pct(quote.amount - a.amountOut, quote.amount)}% below the current quote of ${fmt(a.tokenOut, quote.amount)}; the limit is ${bps / 100}%`,
+      remediation: `Set amountOutMinimum to at least ${fmt(a.tokenOut, (quote.amount * BigInt(10_000 - bps) + 9_999n) / 10_000n)}`,
+    });
+  } else if (a.exact === 'output' && a.amountIn * 10_000n > quote.amount * BigInt(10_000 + bps)) {
+    f.add({
+      code: 'SWAP_SLIPPAGE_TOO_HIGH', outcome: 'block', severity: 'high', path,
+      message: `Swap would pay up to ${fmt(a.tokenIn, a.amountIn)}, ${pct(a.amountIn - quote.amount, quote.amount)}% above the current quote of ${fmt(a.tokenIn, quote.amount)}; the limit is ${bps / 100}%`,
+      remediation: `Set amountInMaximum to at most ${fmt(a.tokenIn, (quote.amount * BigInt(10_000 + bps)) / 10_000n)}`,
+    });
+  }
 }
 
 function checkAction(a: Action, wallet: string, p: CompiledPolicy, f: Findings, spend: Spend): void {
@@ -244,6 +334,20 @@ function checkAction(a: Action, wallet: string, p: CompiledPolicy, f: Findings, 
       }
       return;
 
+    case 'swap':
+      return; // Checked by checkSwap, which needs the whole action list and quotes.
+
+    case 'router_withdrawal':
+      if (a.recipient !== wallet) {
+        f.add({
+          code: 'SWAP_RECIPIENT_NOT_WALLET', outcome: 'block', severity: 'critical', path,
+          message: `Router would send ${a.token ? label(p, a.token) : 'unwrapped ETH'} to ${a.recipient}, not the agent wallet`,
+          remediation: 'Withdraw swap output only to the agent wallet',
+        });
+      }
+      if (a.token && !p.tokens.has(a.token)) unlisted(p, f, path, a.token, 'Router withdrawal');
+      return;
+
     case 'contract_call': {
       const fn = a.selector ? `function ${a.selector}` : 'the fallback function';
       const token = p.tokens.get(a.target);
@@ -262,6 +366,13 @@ function checkAction(a: Action, wallet: string, p: CompiledPolicy, f: Findings, 
             code: 'PROTOCOL_FUNCTION_NOT_ALLOWED', severity: 'high', path,
             message: `${fn} is not an allowed function on ${protocol.name}`,
             remediation: 'Add the selector to the protocol rule after reviewing what it does',
+          });
+        }
+        if (protocol.kind === 'uniswap-v3-router' && !isDecodedRouterSelector(a.selector)) {
+          f.mode(p.policy.unknownContractCalls, {
+            code: 'PROTOCOL_FUNCTION_NOT_DECODED', severity: 'high', path,
+            message: `${fn} on ${protocol.name} is not a function the firewall can decode, so its recipient can't be checked`,
+            remediation: 'Use exactInput/exactOutput swaps, multicall, unwrapWETH9, sweepToken or refundETH',
           });
         }
         if (protocol.maxNativeValue !== undefined && a.value > protocol.maxNativeValue) {
@@ -374,6 +485,54 @@ function checkLimits(input: EngineInput, spend: Spend, f: Findings): void {
   }
 }
 
+function flowsOf(actions: readonly Action[], wallet: string, p: CompiledPolicy, now: number): Flow[] {
+  const flows: Flow[] = [];
+  for (const a of actions) {
+    if (a.type === 'native_transfer' && a.to !== wallet) flows.push({ asset: 'native', to: a.to, amount: a.amount, at: now });
+    if (a.type === 'token_transfer' && a.to !== wallet && p.tokens.has(a.token)) flows.push({ asset: a.token, to: a.to, amount: a.amount, at: now });
+  }
+  return flows;
+}
+
+function checkRecipientWindows(input: EngineInput, flows: readonly Flow[], f: Findings): void {
+  const { policy: p, now } = input;
+  const totals = new Map<string, Flow>();
+  for (const fl of flows) {
+    const key = `${fl.asset}|${fl.to}`;
+    const prior = totals.get(key);
+    totals.set(key, prior ? { ...prior, amount: prior.amount + fl.amount } : fl);
+  }
+  for (const { asset, to, amount } of totals.values()) {
+    const rule = asset === 'native' ? p.policy.native : p.tokens.get(asset);
+    const w = rule?.perRecipient;
+    if (!rule || !w) continue;
+    const since = now - w.windowSeconds * 1000;
+    let all = 0n;
+    let unreviewed = 0n;
+    for (const r of input.session.recentFlows ?? []) {
+      if (r.asset !== asset || r.to !== to || r.at <= since) continue;
+      all += r.amount;
+      if (!r.approved) unreviewed += r.amount;
+    }
+    const fmt = (v: bigint) => (asset === 'native' ? formatNative(p, v) : formatTokenAmount(p, asset, v));
+    const period = formatDuration(w.windowSeconds);
+    if (w.max !== undefined && all + amount > w.max) {
+      f.add({
+        code: 'RECIPIENT_WINDOW_LIMIT', outcome: 'block', severity: 'high',
+        message: `${to} would receive ${fmt(all + amount)} within ${period}; the per-recipient limit is ${fmt(w.max)} (${fmt(all)} already sent or reserved)`,
+        remediation: `Wait until earlier payments to this recipient are older than ${period}`,
+      });
+    }
+    const threshold = w.requireApprovalAbove ?? rule.requireApprovalAbove;
+    if (threshold !== undefined && unreviewed > 0n && unreviewed + amount > threshold) {
+      f.add({
+        code: 'RECIPIENT_WINDOW_THRESHOLD', outcome: 'requireApproval', severity: 'medium',
+        message: `${to} would receive ${fmt(unreviewed + amount)} without review within ${period}, above the ${fmt(threshold)} review threshold (payments to one recipient are summed)`,
+      });
+    }
+  }
+}
+
 export function riskScore(findings: readonly Finding[]): { score: number; level: RiskLevel } {
   const weights = findings.map((x) => SEVERITY_WEIGHT[x.severity]).sort((a, b) => b - a);
   // Highest finding dominates; each further finding adds a geometrically shrinking bonus.
@@ -427,9 +586,11 @@ export function evaluatePolicy(input: EngineInput): EngineResult {
 
   const denied = new Set<string>();
   for (const call of decoded.calls) if (call.to && p.denylist.has(call.to)) denied.add(call.to);
+  let swapIndex = 0;
   for (const a of decoded.actions) {
     for (const addr of addressesOf(a)) if (p.denylist.has(addr)) denied.add(addr);
-    checkAction(a, wallet, p, f, spend);
+    if (a.type === 'swap') checkSwap(a, decoded.actions, wallet, p, f, input.quotes?.[swapIndex++], input.deferQuotes === true);
+    else checkAction(a, wallet, p, f, spend);
   }
   for (const addr of denied) {
     f.add({
@@ -440,6 +601,8 @@ export function evaluatePolicy(input: EngineInput): EngineResult {
   }
 
   checkLimits(input, spend, f);
+  const flows = flowsOf(decoded.actions, wallet, p, input.now);
+  checkRecipientWindows(input, flows, f);
 
   if (input.simulation?.status === 'reverted') {
     f.add({
@@ -463,6 +626,7 @@ export function evaluatePolicy(input: EngineInput): EngineResult {
     findings,
     decoded,
     spend,
+    flows,
     riskScore: score,
     riskLevel: level,
     summary: summarize(verdict, explanation, findings),

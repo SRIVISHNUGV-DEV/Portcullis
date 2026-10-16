@@ -31,6 +31,7 @@ export const T = {
   uint256: { kind: 'uint', bits: 256 },
   uint160: { kind: 'uint', bits: 160 },
   uint48: { kind: 'uint', bits: 48 },
+  uint24: { kind: 'uint', bits: 24 },
   uint8: { kind: 'uint', bits: 8 },
   bool: { kind: 'bool' },
   bytes32: { kind: 'bytes32' },

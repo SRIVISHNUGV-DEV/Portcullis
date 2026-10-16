@@ -163,6 +163,28 @@ describe('MCP', () => {
     expect(wouldBlock.result.structuredContent).toMatchObject({ status: 'checked', verdict: 'blocked' });
   });
 
+  it('cleans up dry-run approvals without changing budgets or existing approvals', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'atf-dry-run-'));
+    const { gateway, wallet } = await setup({ storage: { dir, fsync: false } });
+    const before = await gateway.budget('agent-a');
+    const check = await call(gateway, 'agent-a', 'check_transaction', { to: USDC, data: erc20.transfer(ALICE, usdc('600')) });
+    const checked = check.result.structuredContent;
+    expect(checked).toMatchObject({ status: 'checked', verdict: 'requiresApproval' });
+    expect(await gateway.budget('agent-a')).toEqual(before);
+    expect(gateway.pending()).toEqual([]);
+    expect(() => gateway.status('agent-a', checked.requestId)).toThrow(/Unknown request/);
+
+    const pending = await gateway.transferToken('agent-a', { token: 'USDC', to: BOB, amount: '600' });
+    const withPending = await gateway.budget('agent-a');
+    await call(gateway, 'agent-a', 'check_transaction', { to: USDC, data: erc20.transfer(ALICE, usdc('600')) });
+    expect(await gateway.budget('agent-a')).toEqual(withPending);
+    expect(gateway.pending().map((p) => p.requestId)).toEqual([pending.requestId]);
+    expect(gateway.status('agent-a', pending.requestId).status).toBe('pending_approval');
+    expect(wallet.sent).toHaveLength(0);
+    expect(await gateway.verifyAudit()).toMatchObject({ valid: true });
+    await gateway.close();
+  });
+
   it('does not let the agent choose its budget scope', async () => {
     const { gateway, wallet } = await setup();
     const list = (await handleMcpMessage(gateway, 'agent-a', { jsonrpc: '2.0', id: 1, method: 'tools/list' })) as {
