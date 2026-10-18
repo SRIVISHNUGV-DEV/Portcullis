@@ -5,3 +5,5 @@ coverage/
 *.jsonl
 .env
 .env.*
+!.env.example
+

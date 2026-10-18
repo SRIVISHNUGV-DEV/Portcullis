@@ -144,7 +144,7 @@ describe('MCP', () => {
       result: { tools: { name: string; inputSchema: { type: string } }[] };
     };
     const names = list.result.tools.map((t) => t.name);
-    expect(names).toEqual(['get_budget', 'transfer_token', 'approve_token', 'send_native', 'send_transaction', 'check_transaction', 'get_request_status']);
+    expect(names).toEqual(['get_budget', 'transfer_token', 'approve_token', 'send_native', 'send_transaction', 'check_transaction', 'get_request_status', 'check_sign_typed_data', 'check_sign_message']);
     expect(names.some((n) => n.includes('approve_request'))).toBe(false);
     expect(list.result.tools.every((t) => t.inputSchema.type === 'object')).toBe(true);
   });

@@ -18,7 +18,7 @@ import {
 } from './engine.js';
 import { compilePolicy, type CompiledPolicy } from './policy.js';
 import { TransactionRequestSchema, type NormalizedRequest, type PolicyInput } from './schemas.js';
-import { MemorySessionStore, addSpend, totalSpent, type SessionState, type SessionStore } from './session.js';
+import { MemorySessionStore, addSpend, totalSpent, sweepExpiredReservations, type SessionState, type SessionStore } from './session.js';
 import type { Simulator } from './simulation.js';
 
 export interface FirewallOptions {
@@ -146,7 +146,10 @@ export class Firewall {
         let approvalExpiresAt: number | undefined;
         if (result.verdict === 'allowed') {
           reservationId = this.generateId();
-          state.pending[reservationId] = { spend: result.spend, createdAt: now, requestId };
+          // TTL: reservations expire after 2× the approval TTL so a budget is never
+          // held hostage by an agent that evaluates but never commits or releases.
+          const reservationTtlMs = this.policy.policy.approvalTtlSeconds * 2 * 1000;
+          state.pending[reservationId] = { spend: result.spend, createdAt: now, requestId, expiresAt: now + reservationTtlMs };
           state.txCount += 1;
         } else if (result.verdict === 'requiresApproval') {
           approvalExpiresAt = now + this.policy.policy.approvalTtlSeconds * 1000;
@@ -275,14 +278,18 @@ export class Firewall {
     });
   }
 
-  /** Current session usage (committed + reserved), as base-unit strings. */
-  async usage(sessionId = 'default'): Promise<{ createdAt: string; txCount: number; spent: { native: string; tokens: Record<string, string> }; pendingApprovals: number }> {
-    return this.sessions.transact(sessionId, this.clock(), (state) => ({
-      createdAt: new Date(state.createdAt).toISOString(),
-      txCount: state.txCount,
-      spent: toJsonSafe(totalSpent(state)) as { native: string; tokens: Record<string, string> },
-      pendingApprovals: Object.keys(state.approvals).length,
-    }));
+  /** Current session usage (committed + reserved, excluding expired reservations), as base-unit strings. */
+  async usage(sessionId = 'default'): Promise<{ createdAt: string; txCount: number; spent: { native: string; tokens: Record<string, string> }; pendingApprovals: number; expiredReservationsSwept?: number }> {
+    return this.sessions.transact(sessionId, this.clock(), (state) => {
+      const swept = sweepExpiredReservations(state, this.clock());
+      return {
+        createdAt: new Date(state.createdAt).toISOString(),
+        txCount: state.txCount,
+        spent: toJsonSafe(totalSpent(state)) as { native: string; tokens: Record<string, string> },
+        pendingApprovals: Object.keys(state.approvals).length,
+        ...(swept > 0 ? { expiredReservationsSwept: swept } : {}),
+      };
+    });
   }
 
   private run(request: NormalizedRequest, state: SessionState, now: number, simulation?: SimulationOutcome): EngineResult {

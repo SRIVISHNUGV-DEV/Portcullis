@@ -31,3 +31,6 @@ export { createRpcSimulator } from './simulation.js';
 export type { RpcSimulatorOptions, Simulator } from './simulation.js';
 
 export { formatUnits, parseUnits, UINT256_MAX } from './units.js';
+
+export { evaluateSignRequest } from './gateway.js';
+export type { SignRequest, SignResult } from './gateway.js';

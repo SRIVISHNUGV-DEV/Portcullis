@@ -36,6 +36,110 @@ export interface WalletBackend {
   receipt?(hash: string): Promise<{ readonly status: 'success' | 'reverted' } | null>;
 }
 
+/**
+ * EIP-712 / personal_sign typed-data gate.
+ *
+ * A sign request describes what the agent wants to sign. The gateway routes it through
+ * `evaluateSignRequest()` which applies a deny-by-default policy: known dangerous EIP-712
+ * types (Permit, PermitTransferFrom, EIP-3009 transferWithAuthorization) are decoded and
+ * evaluated the same way a transaction would be. Unknown types and personal_sign are blocked
+ * unless the policy allows them.
+ */
+export interface SignRequest {
+  /** "typedData" for eth_signTypedData_v4, "message" for eth_sign / personal_sign. */
+  readonly type: 'typedData' | 'message';
+  /** The raw JSON string of the EIP-712 TypedData object (for type === 'typedData'). */
+  readonly payload: string;
+}
+
+export interface SignResult {
+  /** allowed — the host may proceed to sign. blocked — the host must not sign. */
+  readonly verdict: 'allowed' | 'blocked';
+  readonly summary: string;
+  readonly reasons: readonly string[];
+}
+
+/**
+ * Evaluate a signing request against a deny-by-default policy.
+ *
+ * Rules (applied in order, first match wins):
+ * 1. personal_sign (`type === 'message'`) — always blocked. Agents do not sign arbitrary messages.
+ * 2. EIP-712 payload that cannot be parsed — blocked (SIGN_PARSE_ERROR).
+ * 3. Known dangerous primary types: Permit, PermitTransferFrom, PermitWitnessTransferFrom,
+ *    TransferWithAuthorization — blocked (SIGN_DANGEROUS_TYPE). These are off-chain approvals
+ *    and transfers: functionally equivalent to an on-chain approve/transfer but invisible to the
+ *    transaction firewall unless intercepted here.
+ * 4. Any other EIP-712 type — blocked (SIGN_UNKNOWN_TYPE). Agents must not sign arbitrary
+ *    structured data; add explicitly allowed types here as requirements are known.
+ *
+ * This is intentionally coarse (v1). The full policy engine (decode Permit fields and apply
+ * token approval limits) is the P1 follow-up. The coarse version closes the disqualifying hole.
+ */
+export function evaluateSignRequest(req: SignRequest): SignResult {
+  if (req.type === 'message') {
+    return {
+      verdict: 'blocked',
+      summary: 'BLOCKED — Agents may not sign arbitrary messages (personal_sign / eth_sign)',
+      reasons: ['SIGN_MESSAGE_BLOCKED: personal_sign grants arbitrary capabilities; only sign via send_transaction with reviewed calldata'],
+    };
+  }
+
+  // Parse the EIP-712 payload.
+  let typed: { primaryType?: unknown; types?: unknown } | undefined;
+  try {
+    typed = JSON.parse(req.payload) as { primaryType?: unknown; types?: unknown };
+  } catch {
+    return {
+      verdict: 'blocked',
+      summary: 'BLOCKED — EIP-712 payload could not be parsed',
+      reasons: ['SIGN_PARSE_ERROR: the typed-data payload is not valid JSON or is not a recognized EIP-712 structure'],
+    };
+  }
+
+  if (!typed || typeof typed.primaryType !== 'string') {
+    return {
+      verdict: 'blocked',
+      summary: 'BLOCKED — EIP-712 payload missing primaryType',
+      reasons: ['SIGN_PARSE_ERROR: EIP-712 primaryType is required'],
+    };
+  }
+
+  const primaryType = typed.primaryType;
+
+  // Known dangerous types: these are off-chain approvals / transfers that route
+  // around the transaction firewall entirely if signed unchallenged.
+  const DANGEROUS_TYPES = new Set([
+    'Permit',                      // EIP-2612: sets allowance via signature
+    'PermitTransferFrom',          // Permit2 SignatureTransfer
+    'PermitWitnessTransferFrom',   // Permit2 witness variant
+    'TransferWithAuthorization',   // EIP-3009: authorized token transfer via signature
+    'ReceiveWithAuthorization',    // EIP-3009 variant
+    'CancelAuthorization',         // EIP-3009 cancel — also privileged
+  ]);
+
+  if (DANGEROUS_TYPES.has(primaryType)) {
+    return {
+      verdict: 'blocked',
+      summary: `BLOCKED — EIP-712 type "${primaryType}" is a dangerous off-chain authorization`,
+      reasons: [
+        `SIGN_DANGEROUS_TYPE: "${primaryType}" grants an off-chain allowance or transfer that bypasses the transaction firewall. ` +
+        'Submit the equivalent on-chain approve/transfer through send_transaction so the firewall can enforce token limits.',
+      ],
+    };
+  }
+
+  // Deny-by-default: any unrecognized EIP-712 type is blocked until explicitly allowed.
+  return {
+    verdict: 'blocked',
+    summary: `BLOCKED — EIP-712 type "${primaryType}" is not on the allowed-types list`,
+    reasons: [
+      `SIGN_UNKNOWN_TYPE: agents may not sign arbitrary EIP-712 payloads. ` +
+      `"${primaryType}" has not been reviewed and added to the gateway sign policy. ` +
+      'Contact the firewall operator to explicitly allow this type after review.',
+    ],
+  };
+}
+
 /** The wallet refused the call before broadcasting it, so its reserved budget can be released. */
 export class WalletRejectedError extends Error {
   constructor(message: string) {
@@ -205,6 +309,12 @@ export interface SubmitOptions {
   readonly session?: string;
   /** Evaluate without executing; an allowed reservation is released immediately. */
   readonly dryRun?: boolean;
+  /**
+   * Caller-assigned unique key. If a request with this key was already submitted and
+   * reached the wallet (status executed, pending_approval, or unknown), the cached
+   * result is returned instead of re-evaluating. Prevents double-execution on retries.
+   */
+  readonly idempotencyKey?: string;
 }
 
 interface Agent {
@@ -244,6 +354,8 @@ export class Gateway {
   readonly config: GatewayConfig;
   private readonly agents = new Map<string, Agent>();
   private readonly tracked = new Map<string, Tracked>();
+  /** idempotencyKey → requestId; prevents double-execution on agent retries. */
+  private readonly idempotencyIndex = new Map<string, string>();
   private readonly closers: (() => Promise<void>)[] = [];
 
   private constructor(
@@ -321,6 +433,16 @@ export class Gateway {
 
   async submit(agentId: string, call: CallInput, options: SubmitOptions = {}): Promise<GatewayResult> {
     const agent = this.agent(agentId);
+    // Idempotency: return the cached result for duplicate submissions from a retrying agent.
+    if (options.idempotencyKey) {
+      const prior = this.idempotencyIndex.get(`${agentId}:${options.idempotencyKey}`);
+      if (prior) {
+        const cached = this.tracked.get(prior);
+        if (cached && ['executed', 'pending_approval', 'unknown'].includes(cached.result.status)) {
+          return cached.result;
+        }
+      }
+    }
     const sessionId = this.sessionId(agent, options.session);
     const verdict = await agent.firewall.evaluate(
       { chainId: this.config.chainId, from: agent.wallet, to: call.to ?? null, value: call.value ?? 0n, data: call.data ?? '0x' },
@@ -332,14 +454,14 @@ export class Gateway {
       if (verdict.allowed) await agent.firewall.release(verdict, 'dry run');
       return base('checked');
     }
-    if (verdict.verdict === 'blocked') return this.track(agent.id, verdict, call, base('blocked'));
+    if (verdict.verdict === 'blocked') return this.track(agent.id, verdict, call, base('blocked'), options.idempotencyKey);
     if (verdict.verdict === 'requiresApproval') {
       return this.track(agent.id, verdict, call, {
         ...base('pending_approval'),
         ...(verdict.approvalExpiresAt ? { approvalExpiresAt: verdict.approvalExpiresAt } : {}),
-      });
+      }, options.idempotencyKey);
     }
-    return this.track(agent.id, verdict, call, await this.execute(agent, verdict, call));
+    return this.track(agent.id, verdict, call, await this.execute(agent, verdict, call), options.idempotencyKey);
   }
 
   /** Encode an ERC-20 transfer of a configured token, in display units (e.g. "12.5"). */
@@ -515,8 +637,11 @@ export class Gateway {
     }
   }
 
-  private track(agentId: string, verdict: Verdict, call: CallInput, result: GatewayResult): GatewayResult {
+  private track(agentId: string, verdict: Verdict, call: CallInput, result: GatewayResult, idempotencyKey?: string): GatewayResult {
     this.tracked.set(verdict.requestId, { agentId, verdict, call, result });
+    if (idempotencyKey) {
+      this.idempotencyIndex.set(`${agentId}:${idempotencyKey}`, verdict.requestId);
+    }
     if (this.tracked.size > MAX_TRACKED) {
       for (const [id, t] of this.tracked) {
         if (t.result.status !== 'pending_approval') {

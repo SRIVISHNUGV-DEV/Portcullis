@@ -8,7 +8,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createInterface } from 'node:readline';
 import { z } from 'zod';
-import { Gateway, GatewayError, type GatewayResult } from './gateway.js';
+import { Gateway, GatewayError, evaluateSignRequest, type GatewayResult } from './gateway.js';
 
 export const MCP_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
 const SERVER_INFO = { name: 'agent-transaction-firewall', version: '0.1.0' };
@@ -45,15 +45,31 @@ const TOOLS = {
     description: 'Status of an earlier request, e.g. one awaiting human approval. A human decides approvals; you cannot approve requests yourself.',
     input: z.object({ requestId: z.string() }).strict(),
   },
+  check_sign_typed_data: {
+    description:
+      'Evaluate an EIP-712 typed-data signing request against the firewall sign policy WITHOUT signing it. ' +
+      'Returns blocked for all dangerous types (Permit, PermitTransferFrom, TransferWithAuthorization, …) and for any unrecognized type. ' +
+      'Call this before asking the wallet to sign any EIP-712 payload. Do not sign if the result is blocked.',
+    input: z.object({ payload: z.string().describe('The full JSON-stringified EIP-712 TypedData object') }).strict(),
+  },
+  check_sign_message: {
+    description:
+      'Evaluate a personal_sign / eth_sign request against the firewall sign policy WITHOUT signing it. ' +
+      'Always returns blocked: agents must not sign arbitrary messages. ' +
+      'Call this before asking the wallet to sign any plain message.',
+    input: z.object({ message: z.string().describe('The message string to be signed') }).strict(),
+  },
 } as const;
 
 type ToolName = keyof typeof TOOLS;
 
 const INSTRUCTIONS =
-  'Wallet tools for an autonomous agent. Every transaction is checked by the Agent Transaction Firewall before it reaches the wallet. ' +
+  'Wallet tools for an autonomous agent. Every transaction and signing request is checked by the Agent Transaction Firewall before reaching the wallet. ' +
   'Results have a status: executed, checked, blocked, pending_approval, rejected, expired, failed or unknown. ' +
   'When blocked, read `reasons[].remediation` and adjust the request instead of retrying it unchanged. ' +
-  'When pending_approval, a human operator decides; poll get_request_status. Never ask the user for keys and never try to bypass these tools.';
+  'When pending_approval, a human operator decides; poll get_request_status. ' +
+  'IMPORTANT: Before calling eth_signTypedData_v4 or personal_sign on any wallet, you MUST call check_sign_typed_data or check_sign_message first. ' +
+  'If the result is blocked, you must not sign. Never ask the user for keys and never try to bypass these tools.';
 
 function toolList() {
   return Object.entries(TOOLS).map(([name, t]) => {
@@ -100,6 +116,10 @@ async function callTool(gateway: Gateway, agentId: string, name: ToolName, args:
       );
     case 'get_request_status':
       return gateway.status(agentId, a.requestId!);
+    case 'check_sign_typed_data':
+      return evaluateSignRequest({ type: 'typedData', payload: a.payload! });
+    case 'check_sign_message':
+      return evaluateSignRequest({ type: 'message', payload: a.message! });
   }
 }
 
@@ -262,5 +282,5 @@ async function route(gateway: Gateway, req: IncomingMessage, res: ServerResponse
 }
 
 export { Gateway, GatewayError };
-export { GatewayConfigSchema, JsonRpcWallet, WalletRejectedError, hashToken } from './gateway.js';
-export type { CallInput, GatewayConfig, GatewayConfigInput, GatewayDeps, GatewayResult, PendingRequest, RequestStatus, SubmitOptions, WalletBackend, WalletCall } from './gateway.js';
+export { GatewayConfigSchema, JsonRpcWallet, WalletRejectedError, evaluateSignRequest, hashToken } from './gateway.js';
+export type { CallInput, GatewayConfig, GatewayConfigInput, GatewayDeps, GatewayResult, PendingRequest, RequestStatus, SignRequest, SignResult, SubmitOptions, WalletBackend, WalletCall } from './gateway.js';

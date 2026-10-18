@@ -3,7 +3,9 @@
 // Spend is reserved atomically with the allow decision, so concurrent requests
 // cannot both pass a cap that only one of them fits under. Reservations stay
 // counted until committed (executed) or released (failed / not sent): an
-// unresolved reservation fails closed by consuming budget.
+// unresolved reservation fails closed by consuming budget. Stale reservations
+// (those past their TTL) are swept from pending on each transact() call so
+// budgets are not held hostage by agents that evaluate but never commit.
 
 import type { SimulationOutcome, Spend } from './engine.js';
 import type { NormalizedRequest } from './schemas.js';
@@ -12,6 +14,8 @@ export interface Reservation {
   readonly spend: Spend;
   readonly createdAt: number;
   readonly requestId: string;
+  /** Unix-ms after which this reservation is automatically released if not committed. */
+  readonly expiresAt?: number;
 }
 
 export interface PendingApproval {
@@ -51,9 +55,27 @@ export function addSpend(a: Spend, b: Spend): Spend {
   return { native: a.native + b.native, tokens };
 }
 
-/** Committed plus all pending reservations. */
-export function totalSpent(state: SessionState): Spend {
-  return Object.values(state.pending).reduce((acc, r) => addSpend(acc, r.spend), state.committed);
+/** Committed plus all pending reservations that have not expired. */
+export function totalSpent(state: SessionState, now?: number): Spend {
+  return Object.values(state.pending)
+    .filter((r) => now === undefined || r.expiresAt === undefined || r.expiresAt > now)
+    .reduce((acc, r) => addSpend(acc, r.spend), state.committed);
+}
+
+/**
+ * Remove expired reservations from state.pending, returning the number swept.
+ * Call inside transact() before reading session totals.
+ */
+export function sweepExpiredReservations(state: SessionState, now: number): number {
+  let swept = 0;
+  for (const [id, r] of Object.entries(state.pending)) {
+    if (r.expiresAt !== undefined && r.expiresAt <= now) {
+      delete state.pending[id];
+      state.txCount = Math.max(0, state.txCount - 1);
+      swept++;
+    }
+  }
+  return swept;
 }
 
 export class MemorySessionStore implements SessionStore {
@@ -74,6 +96,7 @@ export class MemorySessionStore implements SessionStore {
     const critical = previous.then(async () => {
       const current = this.states.get(sessionId) ?? newSessionState(sessionId, now);
       const draft = structuredClone(current);
+      sweepExpiredReservations(draft, now);
       const result = await fn(draft);
       const persisted = this.persist(draft);
       this.states.set(sessionId, draft);

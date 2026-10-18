@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Pre-execution safety and risk gate for autonomous onchain agents: decodes EVM calldata, enforces token-aware policy and explains every verdict before a transaction reaches the agent wallet.",
   "type": "module",
-  "private": true,
+  "private": false,
   "license": "Apache-2.0",
   "engines": {
     "node": ">=20"
@@ -18,6 +18,10 @@
     "./mcp": {
       "types": "./dist/mcp.d.ts",
       "import": "./dist/mcp.js"
+    },
+    "./gateway": {
+      "types": "./dist/gateway.d.ts",
+      "import": "./dist/gateway.js"
     }
   },
   "files": [
@@ -39,7 +43,10 @@
     "erc20",
     "calldata",
     "risk",
-    "policy"
+    "policy",
+    "typed-data",
+    "permit",
+    "audit-log"
   ],
   "dependencies": {
     "zod": "^4.6.5"

@@ -5,6 +5,14 @@
 // downgraded to "unknown call", which would let a malformed transfer bypass token
 // limits. Calls from the agent wallet to itself through `execute`/`executeBatch` are
 // unwrapped recursively so nested transfers cannot hide behind a wallet wrapper.
+//
+// KNOWN LIMITATION — Permit2 SignatureTransfer (off-chain path):
+// This decoder handles Permit2 `approve` (selector 0x87517c45, on-chain allowance grant).
+// It does NOT handle `permitTransferFrom` / `SignatureTransfer` because those are executed
+// by the *recipient*, not the agent: the agent signs an off-chain message, and then a third
+// party calls Permit2 with that signature. The firewall therefore never sees the on-chain
+// leg. Mitigation: route signing through check_sign_typed_data (which blocks PermitTransferFrom
+// typed data) so the signature step is intercepted before anything is broadcast.
 
 import { AbiError, T, decodeAbi, hexToBytes, type AbiType, type AbiValue } from './abi.js';
 import type { CompiledPolicy } from './policy.js';
@@ -222,6 +230,9 @@ const METHODS: Readonly<Record<string, Method>> = {
       }));
     },
   },
+  // permit2.approve (on-chain allowance grant to Permit2). Note: Permit2 SignatureTransfer
+  // (off-chain PermitTransferFrom) is NOT decoded here — it has no agent-initiated on-chain
+  // leg. See the file-level comment for the mitigation.
   [SELECTORS.permit2Approve]: {
     types: [T.address, T.address, T.uint160, T.uint48],
     handle: ([token, spender, amount, expiration], target, path, ctx) =>
