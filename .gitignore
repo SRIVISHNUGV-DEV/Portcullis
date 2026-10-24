@@ -1,9 +1,36 @@
+# Dependencies — never commit installed packages; install from package-lock.json with `npm ci`
 node_modules/
+.pnp
+.pnp.*
+
+# Build output — the package builds to dist/ from source (`npm run build`); the repo ships source, not output
 dist/
+*.tsbuildinfo
+
+# Test coverage
 coverage/
+.nyc_output/
+
+# Logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime data — audit journals and session journals must never be committed
 *.jsonl
+
+# Environment files — real secrets must never be committed; only the example is tracked
 .env
 .env.*
 !.env.example
 
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor and IDE files (project .vscode/ config is tracked intentionally, so it is NOT ignored here)
+.idea/
+*.swp
+*~

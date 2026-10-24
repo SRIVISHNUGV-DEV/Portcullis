@@ -6,7 +6,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D20-339933?style=for-the-badge&logo=node.js)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
 [![ESM](https://img.shields.io/badge/ESM-only-yellow?style=for-the-badge)](package.json)
-[![Tests](https://img.shields.io/badge/Tests-108_passing-brightgreen?style=for-the-badge)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-123_passing-brightgreen?style=for-the-badge)](tests/)
 [![Not on npm](https://img.shields.io/badge/npm-not_published-red?style=for-the-badge)](https://www.npmjs.com/package/agent-transaction-firewall)
 
 ---
@@ -57,6 +57,7 @@ npm run check   # typecheck + tests + build to dist/
 - [MCP gateway for multiple agents](#mcp-gateway-for-multiple-agents)
 - [Latency, measured](#latency-measured)
 - [Run it](#run-it)
+- [Command line](#command-line)
 - [API reference](#api-reference)
 - [Extending: custom stores and sinks](#extending-custom-stores-and-sinks)
 - [Production checklist](#production-checklist)
@@ -501,6 +502,59 @@ Use `firewall.evaluate(tx)` directly when you want the verdict without sending a
 
 ---
 
+## Command line
+
+The same binary (`transaction-firewall`, from `dist/cli.js` after `npm run build`) also works as a one-shot developer CLI. Every command maps to a real library function — there are no stubs, and no second implementation of the rules. It takes JSON files: policies use base-unit strings for amounts (exactly like `gateway.json`), transactions use `{ chainId, from, to?, value?, data? }` or `{ chainId, from, calls: [...] }`.
+
+| Command | Calls | What it does |
+|---|---|---|
+| `evaluate --policy <file> --tx <file> [--session <id>] [--storage <dir>] [--json] [--out <file>]` | `createFirewall()` + `firewall.evaluate()` | Print the verdict (human summary, or full JSON with `--json`); `--out` writes the verdict JSON for the commands below |
+| `approve --policy <file> --verdict <file> --approver <id> [--note <text>] --storage <dir> [--json] [--out <file>]` | `firewall.approve()` | Approve a `requiresApproval` verdict; re-checks caps, returns an `allowed` verdict with a reservation |
+| `reject --policy <file> --verdict <file> --approver <id> [--note <text>] --storage <dir>` | `firewall.reject()` | Reject a pending approval permanently |
+| `commit --policy <file> --verdict <file> [--tx-hash <hash>] --storage <dir>` | `firewall.commit()` | Turn an approved verdict's reservation into committed spend |
+| `release --policy <file> --verdict <file> [--reason <text>] --storage <dir>` | `firewall.release()` | Return an un-sent verdict's reserved budget |
+| `usage --policy <file> [--session <id>] --storage <dir> [--json]` | `firewall.usage()` | Session usage: transactions, committed + reserved spend, pending approvals |
+| `decode --policy <file> --tx <file> [--json]` | `compilePolicy()` + `TransactionRequestSchema.parse()` + `decodeRequest()` | Show the decoded actions and decode issues without deciding anything |
+| `sign-check --type typedData\|message (--payload <file> \| --payload-json <string>)` | `evaluateSignRequest()` | Run a signing request through the sign gate |
+| `policy --policy <file> [--json]` | `compilePolicy()` | Validate a policy and print its hash and counts |
+| `audit-verify --file <audit.jsonl> [--json]` | `JsonlFileAuditSink.read()` + `verifyAuditChain()` | Verify a hash-chained audit log, or name the first broken record |
+| `token` | `hashToken()` | Print a new bearer token and its SHA-256 (for gateway configs) |
+| `serve` / `stdio` | `Gateway` + MCP server | The long-running gateway (see [MCP gateway](#mcp-gateway-for-multiple-agents)) |
+
+Exit codes are scriptable: **0** allowed / success, **1** blocked or error, **2** `requiresApproval`. So `evaluate` can gate a script — an allowed transaction passes, anything else stops it.
+
+```sh
+# Check a policy, then a transaction against it (from the repo root, after npm run build)
+node dist/cli.js policy --policy policy.json
+# policy valid
+# hash: b9e5a3616aea23e3fc928440756ba24c5b960672463bdaa1d55cb2118d22c73a
+# chains: 8453
+# tokens: 1  nfts: 0  protocols: 0
+
+node dist/cli.js evaluate --policy policy.json --tx tx.json
+# verdict: requiresApproval (allowed: false)
+# risk: 30 (medium)
+# summary: NEEDS HUMAN APPROVAL — The agent wants to transfer 600 USDC to 0xa11ce00000000000000000000000000000000001. Review required because: 600 USDC is above the 500 USDC review threshold.
+# (exit code 2)
+```
+
+**Stateful commands need `--storage`.** Reservations and pending approvals live in the session store, so a second process can only see them when both processes share a durable store. The pattern is: evaluate with `--storage <dir>` (which creates `sessions.jsonl` and `audit.jsonl` there, mode `0700`, fsync on), then approve / commit / release / usage against the same directory. Without `--storage`, each command runs against in-memory stores, and a later `approve` will correctly refuse with an explanation instead of silently approving nothing. Verdicts are plain JSON, so `--out verdict.json` from one command feeds `--verdict verdict.json` to the next:
+
+```sh
+node dist/cli.js evaluate --policy policy.json --tx tx.json --storage ./state --out pending.json
+# exit 2: requiresApproval
+node dist/cli.js approve --policy policy.json --verdict pending.json --approver alice@example.com --storage ./state --out approved.json
+# verdict: allowed (allowed: true) ... reservationId: …
+node dist/cli.js commit --policy policy.json --verdict approved.json --tx-hash 0xabc --storage ./state
+# committed reservation …
+node dist/cli.js usage --policy policy.json --storage ./state
+# transactions: 1 ... spent tokens: 0x8335…: 600000000 ... pending approvals: 0
+node dist/cli.js audit-verify --file ./state/audit.jsonl
+# audit chain valid (2 records)
+```
+
+---
+
 ## API reference
 
 Everything is exported from the package root, plus `agent-transaction-firewall/mcp` and `agent-transaction-firewall/gateway`.
@@ -616,7 +670,7 @@ Verified on this tree by running, not by reading badges:
 | Command | Result on this machine |
 |---|---|
 | `npm run typecheck` | Passes (strict TypeScript: `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`) |
-| `npm test` | Passes — **9 files, 108 tests, ~4.6 s** (ABI strictness, decoder, policy edge cases, concurrency, approvals, audit tampering, middleware, simulator) |
+| `npm test` | Passes — **10 files, 123 tests, ~10.6 s** (ABI strictness, decoder, policy edge cases, concurrency, approvals, audit tampering, middleware, simulator, CLI) |
 | `npm run build` | Passes — emits ESM + declarations to `dist/` |
 | `npm run bench` | See [Latency, measured](#latency-measured) |
 | `node scripts/fork-lab.mjs` | Not run here — needs Foundry `anvil`, which is not installed on this machine |
@@ -642,7 +696,7 @@ src/simulation.ts  optional eth_call simulator
 src/schemas.ts     Zod schemas for requests and policies
 src/canonical.ts   canonicalization and hashing helpers
 src/units.ts       amount helpers
-tests/             9 files, 108 tests
+tests/             10 files, 123 tests (including tests/cli.test.ts: the CLI, end to end)
 scripts/bench.mjs  latency and throughput measurement
 scripts/fork-lab.mjs  Base mainnet fork lab (needs anvil)
 ```

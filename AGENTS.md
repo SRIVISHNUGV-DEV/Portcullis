@@ -11,7 +11,7 @@ A pre-execution safety and risk gate for autonomous onchain agents: decode EVM c
 ```sh
 npm ci            # install from the lockfile
 npm run check     # the gate: typecheck + tests + build. Run this before you call anything done.
-npm test          # vitest, 9 files, 108 tests
+npm test          # vitest, 10 files, 123 tests (including tests/cli.test.ts)
 npm run typecheck # strict TS: exactOptionalPropertyTypes, noUncheckedIndexedAccess
 npm run build     # emits ESM + declarations to dist/
 npm run bench     # latency / throughput (see README for measured numbers)
@@ -31,7 +31,10 @@ src/session.ts     session store interface + in-memory implementation
 src/storage.ts     group-commit writer and journaled session store
 src/gateway.ts     multi-agent gateway: auth, wallet backends, approval queue, sign gate
 src/mcp.ts         MCP server (stdio + HTTP) and admin API
-src/cli.ts         transaction-firewall command (serve | stdio | token)
+src/cli.ts         transaction-firewall command: gateway (serve | stdio | token) plus dev commands
+                   (evaluate | approve | reject | commit | release | usage | decode | sign-check |
+                   policy | audit-verify), each mapped to its real library function — see README § Command line
+tests/cli.test.ts  CLI end-to-end tests (spawn dist/cli.js; beforeAll rebuilds dist/)
 src/audit.ts       hash-chained audit log and sinks
 src/simulation.ts  optional eth_call simulator (timeout 1500 ms)
 src/schemas.ts     Zod schemas for requests and policies
