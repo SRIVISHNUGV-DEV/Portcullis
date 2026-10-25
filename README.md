@@ -1,4 +1,4 @@
-# Agent Transaction Firewall
+# Portcullis
 
 > Most agent value moves as ERC-20 calldata with `value = 0`. A gate that only looks at native ETH value sees a $5M USDC transfer, an unlimited `approve`, or a `setApprovalForAll` to a drainer as a harmless zero-value call. This firewall decodes the calldata first, and decides second.
 
@@ -7,7 +7,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
 [![ESM](https://img.shields.io/badge/ESM-only-yellow?style=for-the-badge)](package.json)
 [![Tests](https://img.shields.io/badge/Tests-123_passing-brightgreen?style=for-the-badge)](tests/)
-[![Not on npm](https://img.shields.io/badge/npm-not_published-red?style=for-the-badge)](https://www.npmjs.com/package/agent-transaction-firewall)
+[![Not on npm](https://img.shields.io/badge/npm-not_published-red?style=for-the-badge)](https://github.com/SRIVISHNUGV-DEV/portcullis)
 
 ---
 
@@ -24,8 +24,8 @@ const verdict = await firewall.evaluate(tx, { sessionId: 'run-42' });
 **Install from source** (the package is not on npm — verified: the registry returns 404):
 
 ```sh
-git clone https://github.com/SRIVISHNUGV-DEV/agent-transaction-firewall.git
-cd agent-transaction-firewall
+git clone https://github.com/SRIVISHNUGV-DEV/portcullis.git
+cd portcullis
 npm ci
 npm run check   # typecheck + tests + build to dist/
 ```
@@ -72,7 +72,7 @@ npm run check   # typecheck + tests + build to dist/
 
 ```mermaid
 flowchart LR
-    A["Agent or LLM tool call"] -->|to, value, data| F["Agent Transaction Firewall"]
+    A["Agent or LLM tool call"] -->|to, value, data| F["Portcullis"]
     F -->|allowed| W["Wallet or signer RPC"]
     F -->|requiresApproval| Q["Approval queue"]
     Q -->|human approves| W
@@ -361,7 +361,7 @@ A session is a budget scope (for example, one agent run): `evaluate(tx, { sessio
 Every evaluation, approval, rejection, commit and release is appended as a SHA-256 hash-chained record containing the policy hash, transaction digest, normalized request, decoded actions, findings and verdict. No secrets are involved: inputs are public transaction fields. Measured live: a 5-record chain verifies as `{ valid: true }`.
 
 ```ts
-import { JsonlFileAuditSink, verifyAuditChain } from 'agent-transaction-firewall';
+import { JsonlFileAuditSink, verifyAuditChain } from 'portcullis';
 const audit = new JsonlFileAuditSink('/var/log/agent-firewall/audit.jsonl', { fsync: true }); // continues the chain after restart
 const firewall = createFirewall({ policy, audit });
 verifyAuditChain(await JsonlFileAuditSink.read(audit.path)); // { valid: true } or the first broken record
@@ -410,7 +410,7 @@ Optional simulation: `createFirewall({ simulator: createRpcSimulator({ url }) })
 
 ## MCP gateway for multiple agents
 
-`agent-transaction-firewall/mcp` turns the firewall into the **only path to the wallet**: a gateway that holds wallet access, serves any number of agents over the [Model Context Protocol](https://modelcontextprotocol.io), and sends only what the firewall allows.
+`portcullis/mcp` turns the firewall into the **only path to the wallet**: a gateway that holds wallet access, serves any number of agents over the [Model Context Protocol](https://modelcontextprotocol.io), and sends only what the firewall allows.
 
 ```mermaid
 flowchart LR
@@ -477,7 +477,7 @@ npm run check   # typecheck + tests + build
 ```
 
 ```ts
-import { createFirewall, guard, parseUnits } from 'agent-transaction-firewall';
+import { createFirewall, guard, parseUnits } from 'portcullis';
 
 const firewall = createFirewall({ policy: {
   version: 1, chainIds: [8453],
@@ -557,7 +557,7 @@ node dist/cli.js audit-verify --file ./state/audit.jsonl
 
 ## API reference
 
-Everything is exported from the package root, plus `agent-transaction-firewall/mcp` and `agent-transaction-firewall/gateway`.
+Everything is exported from the package root, plus `portcullis/mcp` and `portcullis/gateway`.
 
 | Member | Description |
 |---|---|

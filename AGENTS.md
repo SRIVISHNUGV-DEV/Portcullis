@@ -1,4 +1,4 @@
-# AGENTS.md — agent instructions for agent-transaction-firewall
+# AGENTS.md — agent instructions for portcullis
 
 Read this before changing anything in this repo. The README describes what the firewall does; this file describes how to work on it without breaking it.
 

@@ -11,7 +11,7 @@ import { z } from 'zod';
 import { Gateway, GatewayError, evaluateSignRequest, type GatewayResult } from './gateway.js';
 
 export const MCP_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
-const SERVER_INFO = { name: 'agent-transaction-firewall', version: '0.1.0' };
+const SERVER_INFO = { name: 'portcullis', version: '0.1.0' };
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 const address = z.string().describe('0x-prefixed 20-byte address');
@@ -64,7 +64,7 @@ const TOOLS = {
 type ToolName = keyof typeof TOOLS;
 
 const INSTRUCTIONS =
-  'Wallet tools for an autonomous agent. Every transaction and signing request is checked by the Agent Transaction Firewall before reaching the wallet. ' +
+  'Wallet tools for an autonomous agent. Every transaction and signing request is checked by the Portcullis before reaching the wallet. ' +
   'Results have a status: executed, checked, blocked, pending_approval, rejected, expired, failed or unknown. ' +
   'When blocked, read `reasons[].remediation` and adjust the request instead of retrying it unchanged. ' +
   'When pending_approval, a human operator decides; poll get_request_status. ' +

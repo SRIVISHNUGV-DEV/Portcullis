@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Command-line interface for the Agent Transaction Firewall.
+// Command-line interface for the Portcullis.
 //
 // Two surfaces share this binary:
 //
