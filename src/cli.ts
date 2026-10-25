@@ -4,9 +4,9 @@
 // Two surfaces share this binary:
 //
 //   Gateway (multi-agent, long-running) — the original commands:
-//     transaction-firewall serve --config gateway.json            HTTP MCP for many agents + admin API
-//     transaction-firewall stdio --config gateway.json --agent ID  MCP over stdio for one agent
-//     transaction-firewall token                                  generate a bearer <redacted> and its SHA-256
+//     pcl serve --config gateway.json            HTTP MCP for many agents + admin API
+//     pcl stdio --config gateway.json --agent ID  MCP over stdio for one agent
+//     pcl token                                  generate a bearer <redacted> and its SHA-256
 //
 //   Developer commands (one-shot, mapped 1:1 to real library functions):
 //     evaluate      -> createFirewall() + firewall.evaluate()
@@ -47,30 +47,30 @@ import { JournalSessionStore } from './storage.js';
 
 const HELP = `Usage:
   Gateway:
-    transaction-firewall serve --config <file>             HTTP MCP + admin API
-    transaction-firewall stdio --config <file> [--agent <id>]
-    transaction-firewall token                              print a bearer <redacted> + its SHA-256
+    pcl serve --config <file>             HTTP MCP + admin API
+    pcl stdio --config <file> [--agent <id>]
+    pcl token                              print a bearer <redacted> + its SHA-256
 
   Developer commands (each maps to a real library function):
-    transaction-firewall evaluate --policy <file> --tx <file> [--session <id>] [--storage <dir>] [--json] [--out <file>]
+    pcl evaluate --policy <file> --tx <file> [--session <id>] [--storage <dir>] [--json] [--out <file>]
       createFirewall() + firewall.evaluate()
-    transaction-firewall approve --policy <file> --verdict <file> --approver <id> [--note <text>] --storage <dir> [--json] [--out <file>]
+    pcl approve --policy <file> --verdict <file> --approver <id> [--note <text>] --storage <dir> [--json] [--out <file>]
       firewall.approve()
-    transaction-firewall reject --policy <file> --verdict <file> --approver <id> [--note <text>] --storage <dir>
+    pcl reject --policy <file> --verdict <file> --approver <id> [--note <text>] --storage <dir>
       firewall.reject()
-    transaction-firewall commit --policy <file> --verdict <file> [--tx-hash <hash>] --storage <dir>
+    pcl commit --policy <file> --verdict <file> [--tx-hash <hash>] --storage <dir>
       firewall.commit()
-    transaction-firewall release --policy <file> --verdict <file> [--reason <text>] --storage <dir>
+    pcl release --policy <file> --verdict <file> [--reason <text>] --storage <dir>
       firewall.release()
-    transaction-firewall usage --policy <file> [--session <id>] --storage <dir> [--json]
+    pcl usage --policy <file> [--session <id>] --storage <dir> [--json]
       firewall.usage()
-    transaction-firewall decode --policy <file> --tx <file> [--json]
+    pcl decode --policy <file> --tx <file> [--json]
       compilePolicy() + TransactionRequestSchema.parse() + decodeRequest()
-    transaction-firewall sign-check --type typedData|message (--payload <file> | --payload-json <string>)
+    pcl sign-check --type typedData|message (--payload <file> | --payload-json <string>)
       evaluateSignRequest()
-    transaction-firewall policy --policy <file> [--json]
+    pcl policy --policy <file> [--json]
       compilePolicy()
-    transaction-firewall audit-verify --file <audit.jsonl> [--json]
+    pcl audit-verify --file <audit.jsonl> [--json]
       JsonlFileAuditSink.read() + verifyAuditChain()
 
   Exit codes: 0 allowed/success, 1 blocked/error, 2 requiresApproval.
@@ -451,7 +451,7 @@ async function main(): Promise<void> {
     return;
   }
   if ((command !== 'serve' && command !== 'stdio') || !values.config) {
-    process.stderr.write('Usage: transaction-firewall serve|stdio --config <file> [--agent <id>] | token\n');
+    process.stderr.write('Usage: pcl serve|stdio --config <file> [--agent <id>] | token\n');
     process.exitCode = 2;
     return;
   }

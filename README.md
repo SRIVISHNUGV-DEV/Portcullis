@@ -448,9 +448,9 @@ flowchart LR
 ```
 
 ```sh
-npx transaction-firewall token                                   # prints a new token and its SHA-256
-npx transaction-firewall serve --config gateway.json             # HTTP MCP + admin API
-npx transaction-firewall stdio --config gateway.json --agent payments-bot
+npx pcl token                                   # prints a new token and its SHA-256
+npx pcl serve --config gateway.json             # HTTP MCP + admin API
+npx pcl stdio --config gateway.json --agent payments-bot
 ```
 
 MCP client config for an agent: `{ "mcpServers": { "wallet": { "type": "http", "url": "http://127.0.0.1:8787/mcp", "headers": { "Authorization": "Bearer <agent token>" } } } }`.
@@ -506,7 +506,7 @@ Use `firewall.evaluate(tx)` directly when you want the verdict without sending a
 
 ## Command line
 
-The same binary (`transaction-firewall`, from `dist/cli.js` after `npm run build`) also works as a one-shot developer CLI. Every command maps to a real library function — there are no stubs, and no second implementation of the rules. It takes JSON files: policies use base-unit strings for amounts (exactly like `gateway.json`), transactions use `{ chainId, from, to?, value?, data? }` or `{ chainId, from, calls: [...] }`.
+The same binary (`pcl`, from `dist/cli.js` after `npm run build`) also works as a one-shot developer CLI. Every command maps to a real library function — there are no stubs, and no second implementation of the rules. It takes JSON files: policies use base-unit strings for amounts (exactly like `gateway.json`), transactions use `{ chainId, from, to?, value?, data? }` or `{ chainId, from, calls: [...] }`.
 
 | Command | Calls | What it does |
 |---|---|---|
@@ -692,7 +692,7 @@ src/session.ts     session store interface + in-memory implementation
 src/storage.ts     group-commit writer and journaled session store
 src/gateway.ts     multi-agent gateway: auth, wallet backends, approval queue, sign gate
 src/mcp.ts         MCP server (stdio + HTTP) and admin API
-src/cli.ts         transaction-firewall command
+src/cli.ts         pcl command
 src/audit.ts       hash-chained audit log and sinks
 src/simulation.ts  optional eth_call simulator
 src/schemas.ts     Zod schemas for requests and policies

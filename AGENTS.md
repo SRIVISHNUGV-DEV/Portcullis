@@ -31,7 +31,7 @@ src/session.ts     session store interface + in-memory implementation
 src/storage.ts     group-commit writer and journaled session store
 src/gateway.ts     multi-agent gateway: auth, wallet backends, approval queue, sign gate
 src/mcp.ts         MCP server (stdio + HTTP) and admin API
-src/cli.ts         transaction-firewall command: gateway (serve | stdio | token) plus dev commands
+src/cli.ts         pcl command: gateway (serve | stdio | token) plus dev commands
                    (evaluate | approve | reject | commit | release | usage | decode | sign-check |
                    policy | audit-verify), each mapped to its real library function — see README § Command line
 tests/cli.test.ts  CLI end-to-end tests (spawn dist/cli.js; beforeAll rebuilds dist/)
