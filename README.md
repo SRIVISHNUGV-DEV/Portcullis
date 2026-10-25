@@ -13,6 +13,8 @@
 
 A pre-execution safety and risk gate for autonomous onchain agents. Every EVM transaction an agent proposes is decoded down to the asset level, checked against a deterministic policy, explained in plain English, and recorded in a hash-chained audit log — **before** it reaches the wallet. No network calls on the decision path, no randomness, no oracle: the same input always gives the same verdict, which is what makes decisions reviewable and testable.
 
+Portcullis is deliberately small, and that is where its elegance lies: a single deterministic policy engine defines every verdict, the CLI, the MCP tools, and the gateway all call the same functions, so there is no second implementation of the rules to drift, and the only runtime dependency is `zod`. Verdicts travel as plain JSON; the audit log is hash-chained.
+
 ```ts
 const verdict = await firewall.evaluate(tx, { sessionId: 'run-42' });
 // verdict.verdict: "allowed" | "blocked" | "requiresApproval"
@@ -710,3 +712,9 @@ The decoding and scoring approach is derived from ATF's `packages/compiler/risk/
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 Corven Labs.
+
+---
+
+> Perfection is achieved, not when there is nothing more to add, but when there is nothing left to take away.
+>
+> — Antoine de Saint-Exupéry
